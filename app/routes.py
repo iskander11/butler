@@ -8,7 +8,7 @@ import click
 from flask import (Blueprint, abort, flash, redirect, render_template,
                    request, session, url_for)
 from .auth import check_auth, login_required
-from .db import get_db, get_setting, set_setting, parse_ports_raw
+from .db import get_db, parse_ports_raw
 from . import firewall as fw
 from logparse import parse_log_line
 
@@ -92,14 +92,12 @@ def firewall_reset_command():
 @login_required
 def index():
     db = get_db()
-    mode = get_setting('firewall_mode', 'whitelist')
     stats = {
         'services': db.execute('SELECT COUNT(*) AS count FROM services').fetchone()['count'],
         'attempts': db.execute('SELECT COUNT(*) AS count FROM attempts').fetchone()['count'],
         'whitelist': db.execute('SELECT COUNT(*) AS count FROM whitelist_entries WHERE enabled = 1').fetchone()['count'],
-        'blacklist': db.execute('SELECT COUNT(*) AS count FROM blacklist_entries WHERE enabled = 1').fetchone()['count'],
     }
-    return render_template('index.html', stats=stats, mode=mode)
+    return render_template('index.html', stats=stats)
 
 
 # ---------------------------------------------------------------------------
@@ -337,36 +335,6 @@ def allow_attempt(attempt_id):
     return redirect(url_for('main.attempts'))
 
 
-@bp.route('/attempts/<int:attempt_id>/block', methods=['POST'])
-@login_required
-def block_attempt(attempt_id):
-    _check_csrf()
-    db = get_db()
-    row = db.execute('SELECT * FROM attempts WHERE id = ?', (attempt_id,)).fetchone()
-    if row is None:
-        flash('Попытка не найдена.', 'error')
-        return redirect(url_for('main.attempts'))
-
-    ip = str(ipaddress.ip_network(row['ip_address'], strict=False))
-    exists = db.execute(
-        'SELECT id FROM blacklist_entries WHERE ip_address = ? AND enabled = 1', (ip,)
-    ).fetchone()
-    if exists:
-        flash(f'IP {ip} уже в чёрном списке.', 'error')
-        return redirect(url_for('main.attempts'))
-
-    db.execute('INSERT INTO blacklist_entries (ip_address, reason, comment) VALUES (?, ?, ?)',
-               (ip, 'Заблокирован из попыток', f'Порт {row["port"]}, попыток: {row["attempts_count"]}'))
-    db.execute('UPDATE attempts SET status = ? WHERE id = ?', ('blocked', attempt_id))
-    db.execute(
-        'INSERT INTO audit_log (action, target_type, target_value, comment) VALUES (?, ?, ?, ?)',
-        ('block', 'ip', ip, f'Заблокирован из попыток, порт {row["port"]}')
-    )
-    db.commit()
-    flash(f'IP {ip} добавлен в чёрный список.', 'success')
-    return redirect(url_for('main.attempts'))
-
-
 @bp.route('/attempts')
 @login_required
 def attempts():
@@ -385,10 +353,6 @@ def attempts():
         label = r['owner_name'] or r['comment'] or ''
         if label:
             ip_labels[_norm_ip_key(r['ip_address'])] = ('whitelist', label)
-    for r in db.execute('SELECT ip_address, reason, comment FROM blacklist_entries WHERE enabled = 1').fetchall():
-        label = r['comment'] or r['reason'] or ''
-        if label:
-            ip_labels[_norm_ip_key(r['ip_address'])] = ('blacklist', label)
 
     return render_template('attempts.html', attempts=rows, ip_labels=ip_labels)
 
@@ -528,140 +492,6 @@ def edit_whitelist_entry(entry_id):
 
 
 # ---------------------------------------------------------------------------
-# Blacklist
-# ---------------------------------------------------------------------------
-
-@bp.route('/blacklist', methods=['GET', 'POST'])
-@login_required
-def blacklist():
-    db = get_db()
-    if request.method == 'POST':
-        _check_csrf()
-        ip_address_raw = request.form['ip_address'].strip()
-        reason  = request.form['reason'].strip()
-        comment = request.form['comment'].strip()
-
-        error = None
-        normalized_ip = None
-
-        if not ip_address_raw:
-            error = 'IP-адрес обязателен.'
-        else:
-            normalized_ip = validate_ip_address(ip_address_raw)
-            if normalized_ip is None:
-                error = 'Укажите корректный IPv4 или IPv6 адрес.'
-
-        if error is None:
-            existing = db.execute(
-                'SELECT id FROM blacklist_entries WHERE ip_address = ? AND enabled = 1',
-                (normalized_ip,)
-            ).fetchone()
-            if existing is not None:
-                error = f'IP-адрес {normalized_ip} уже есть в чёрном списке.'
-
-        if error is None:
-            try:
-                db.execute(
-                    'INSERT INTO blacklist_entries (ip_address, reason, comment) VALUES (?, ?, ?)',
-                    (normalized_ip, reason, comment)
-                )
-                db.execute(
-                    'INSERT INTO audit_log (action, target_type, target_value, comment) VALUES (?, ?, ?, ?)',
-                    ('block', 'ip', normalized_ip, comment or reason or 'IP добавлен в чёрный список')
-                )
-                db.commit()
-                flash(f'IP {normalized_ip} добавлен в чёрный список.', 'success')
-            except Exception:
-                flash('Не удалось добавить запись.', 'error')
-        else:
-            flash(error, 'error')
-
-        return redirect(url_for('main.blacklist'))
-
-    rows = db.execute(
-        'SELECT * FROM blacklist_entries WHERE enabled = 1 ORDER BY created_at DESC, id DESC'
-    ).fetchall()
-    return render_template('blacklist.html', entries=rows)
-
-
-@bp.route('/blacklist/<int:entry_id>/delete', methods=['POST'])
-@login_required
-def delete_blacklist_entry(entry_id):
-    _check_csrf()
-    db = get_db()
-    entry = db.execute(
-        'SELECT * FROM blacklist_entries WHERE id = ? AND enabled = 1', (entry_id,)
-    ).fetchone()
-    if entry is None:
-        flash('Запись чёрного списка не найдена.', 'error')
-        return redirect(url_for('main.blacklist'))
-
-    db.execute('UPDATE blacklist_entries SET enabled = 0 WHERE id = ?', (entry_id,))
-    db.execute(
-        'INSERT INTO audit_log (action, target_type, target_value, comment) VALUES (?, ?, ?, ?)',
-        ('delete', 'blacklist', entry['ip_address'], 'Запись отключена в чёрном списке')
-    )
-    db.commit()
-    flash(f'IP {entry["ip_address"]} удалён из чёрного списка.', 'success')
-    return redirect(url_for('main.blacklist'))
-
-
-@bp.route('/blacklist/<int:entry_id>/edit', methods=['GET', 'POST'])
-@login_required
-def edit_blacklist_entry(entry_id):
-    db = get_db()
-    entry = db.execute(
-        'SELECT * FROM blacklist_entries WHERE id = ? AND enabled = 1', (entry_id,)
-    ).fetchone()
-    if entry is None:
-        flash('Запись чёрного списка не найдена.', 'error')
-        return redirect(url_for('main.blacklist'))
-
-    if request.method == 'POST':
-        _check_csrf()
-        ip_address_raw = request.form['ip_address'].strip()
-        reason  = request.form['reason'].strip()
-        comment = request.form['comment'].strip()
-
-        error = None
-        normalized_ip = None
-
-        if not ip_address_raw:
-            error = 'IP-адрес обязателен.'
-        else:
-            normalized_ip = validate_ip_address(ip_address_raw)
-            if normalized_ip is None:
-                error = 'Укажите корректный IPv4 или IPv6 адрес.'
-
-        if error is None:
-            existing_entry = db.execute(
-                'SELECT id FROM blacklist_entries WHERE ip_address = ? AND enabled = 1 AND id != ?',
-                (normalized_ip, entry_id)
-            ).fetchone()
-            if existing_entry is not None:
-                error = f'IP-адрес {normalized_ip} уже есть в чёрном списке.'
-
-        if error is None:
-            db.execute(
-                'UPDATE blacklist_entries SET ip_address = ?, reason = ?, comment = ? WHERE id = ?',
-                (normalized_ip, reason, comment, entry_id)
-            )
-            db.execute(
-                'INSERT INTO audit_log (action, target_type, target_value, comment) VALUES (?, ?, ?, ?)',
-                ('update', 'blacklist', normalized_ip, 'Запись чёрного списка изменена')
-            )
-            db.commit()
-            flash(f'Запись {normalized_ip} обновлена.', 'success')
-            return redirect(url_for('main.blacklist'))
-
-        flash(error, 'error')
-        entry = {'id': entry_id, 'ip_address': ip_address_raw,
-                 'reason': reason, 'comment': comment}
-
-    return render_template('blacklist_edit.html', entry=entry)
-
-
-# ---------------------------------------------------------------------------
 # Audit log
 # ---------------------------------------------------------------------------
 
@@ -704,8 +534,7 @@ def conntrack_drop_ips():
 
     if drop_all:
         rows = db.execute(
-            'SELECT ip_address FROM whitelist_entries WHERE enabled = 1 '
-            'UNION SELECT ip_address FROM blacklist_entries WHERE enabled = 1'
+            'SELECT ip_address FROM whitelist_entries WHERE enabled = 1'
         ).fetchall()
         ips = [r['ip_address'] for r in rows]
     else:
@@ -781,33 +610,19 @@ def conntrack_drop_ports():
 
 
 # ---------------------------------------------------------------------------
-# Firewall settings / apply / reset
+# Firewall apply / reset
 # ---------------------------------------------------------------------------
 
-@bp.route('/settings/firewall-mode', methods=['POST'])
-@login_required
-def set_firewall_mode():
-    _check_csrf()
-    new_mode = request.form.get('mode', 'whitelist')
-    if new_mode not in ('whitelist', 'blacklist'):
-        flash('Неверный режим.', 'error')
-        return redirect(url_for('main.firewall'))
-    old_mode = get_setting('firewall_mode', 'whitelist')
-    set_setting('firewall_mode', new_mode)
-    get_db().execute(
-        'INSERT INTO audit_log (action, target_type, target_value, comment) VALUES (?, ?, ?, ?)',
-        ('setting', 'firewall_mode', new_mode, f'Режим изменён с {old_mode} на {new_mode}')
-    )
-    get_db().commit()
-    flash(f'Режим изменён на: {"только белый список" if new_mode == "whitelist" else "только чёрный список"}.', 'success')
-    return redirect(url_for('main.firewall'))
-
-
-@bp.route('/firewall')
+@bp.route('/firewall', methods=['GET'])
 @login_required
 def firewall():
     rules, mode, skipped = fw.build_rules()
-    return render_template('firewall.html', rules=rules, mode=mode, skipped=skipped)
+    return render_template(
+        'firewall.html',
+        rules=rules,
+        mode=mode,
+        skipped=skipped,
+    )
 
 
 @bp.route('/firewall/export', methods=['POST'])
@@ -828,9 +643,8 @@ def firewall_apply():
         flash('Применение отменено: не подтверждено.', 'error')
         return redirect(url_for('main.firewall'))
     try:
-        fw.write_generated_rules_file()
         generated_file, target_file, backup_file = fw.apply_firewall_rules()
-        msg = f'Правила применены. Generated: {generated_file}.'
+        msg = 'Правила применены.'
         if target_file:
             msg += f' Target: {target_file}.'
         if backup_file:

@@ -20,6 +20,19 @@
     --shadow-md:    0 4px 16px rgba(0,0,0,0.10);
 }
 
+.diag-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: flex-end;
+}
+.diag-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.9rem;
+}
+
 /* --- Сброс и база --- */
 *, *::before, *::after { box-sizing: border-box; }
 
@@ -228,36 +241,6 @@ body {
     border: 1px solid #86efac;
 }
 
-.mode-badge-blacklist {
-    background: #fee2e2;
-    color: #b91c1c;
-    border: 1px solid #fca5a5;
-}
-
-.mode-switcher {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    margin: 12px 0;
-}
-
-.mode-active {
-    background: var(--primary) !important;
-    color: #fff !important;
-    border-color: var(--primary) !important;
-}
-
-.mode-inactive {
-    background: #f1f5f9;
-    color: #475569;
-    border: 1px solid var(--border);
-}
-
-.mode-inactive:hover {
-    background: #e2e8f0;
-    color: var(--text);
-}
-
 .mode-hint {
     margin-top: 12px;
     padding: 12px 16px;
@@ -269,12 +252,6 @@ body {
     background: #f0fdf4;
     border: 1px solid #86efac;
     color: #15803d;
-}
-
-.mode-hint-blacklist {
-    background: #fef2f2;
-    border: 1px solid #fca5a5;
-    color: #b91c1c;
 }
 
 /* ============================================================
@@ -495,7 +472,6 @@ code {
 }
 
 .ip-label-whitelist { background: #dcfce7; color: #15803d; }
-.ip-label-blacklist { background: #fee2e2; color: #b91c1c; }
 
 /* ============================================================
    Flash-сообщения

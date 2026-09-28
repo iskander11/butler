@@ -26,16 +26,19 @@ Butler управляет доступом к сервисам через UFW (U
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+from functools import wraps
 from datetime import datetime
 from pathlib import Path
 
 from flask import current_app
 
-from .db import get_db, get_setting, parse_ports_raw
+from .db import get_db, parse_ports_raw
 
 # Полный путь к ufw обязателен для совпадения с NOPASSWD в sudoers (Astra Linux).
 _UFW = shutil.which('ufw') or '/usr/sbin/ufw'
@@ -93,6 +96,8 @@ def _try_command(command, timeout=15):
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, f'timeout ({timeout}s)'
+    except (FileNotFoundError, OSError) as exc:
+        return False, str(exc)
     if result.returncode != 0:
         return False, (result.stderr.strip() or result.stdout.strip())
     return True, result.stdout
@@ -146,41 +151,351 @@ def _iter_service_specs():
 def _rule_commands():
     """Построить список UFW-команд (списки argv) для применения из текущей БД.
 
+    Только белый список: сервис доступен исключительно с IP из whitelist.
+    Порт, который не добавлен как сервис (в том числе опубликованный Docker),
+    закрывается общим deny — иначе чужой LAN-allow или default-дыры его пускают.
+
     Все правила снабжаются `comment 'butler'` для последующей идемпотентной чистки.
     Возвращает (commands: list[list[str]], mode: str, skipped: list[str]).
     """
-    mode = get_setting('firewall_mode', 'whitelist')
     db = get_db()
-
     whitelist_rows = db.execute(
         'SELECT ip_address FROM whitelist_entries WHERE enabled = 1 ORDER BY ip_address'
     ).fetchall()
-    blacklist_rows = db.execute(
-        'SELECT ip_address FROM blacklist_entries WHERE enabled = 1 ORDER BY ip_address'
-    ).fetchall()
-
-    whitelist_ips, wl_invalid = _collect_ips(whitelist_rows)
-    blacklist_ips, bl_invalid = _collect_ips(blacklist_rows)
-    skipped = wl_invalid + bl_invalid
+    whitelist_ips, skipped = _collect_ips(whitelist_rows)
+    if skipped:
+        raise ValueError('Некорректные адреса белого списка: ' + ', '.join(skipped))
 
     commands = []
-    for port, proto in _iter_service_specs():
-        if mode == 'whitelist':
-            for ip in whitelist_ips:
-                commands.append(
-                    _ufw_cmd('allow', 'from', ip, 'to', 'any', 'port', str(port),
-                             'proto', proto, 'comment', BUTLER_TAG)
-                )
-            commands.append(_ufw_cmd('deny', f'{port}/{proto}', 'comment', BUTLER_TAG))
-        else:  # blacklist
-            for ip in blacklist_ips:
-                commands.append(
-                    _ufw_cmd('deny', 'from', ip, 'to', 'any', 'port', str(port),
-                             'proto', proto, 'comment', BUTLER_TAG)
-                )
-            commands.append(_ufw_cmd('allow', f'{port}/{proto}', 'comment', BUTLER_TAG))
 
-    return commands, mode, skipped
+    for port, proto in _iter_service_specs():
+        if not whitelist_ips:
+            commands.append(_ufw_cmd('allow', f'{port}/{proto}', 'comment', BUTLER_TAG))
+            continue
+        for ip in whitelist_ips:
+            commands.append(
+                _ufw_cmd('allow', 'from', ip, 'to', 'any', 'port', str(port),
+                         'proto', proto, 'comment', BUTLER_TAG)
+            )
+        commands.append(_ufw_cmd('deny', f'{port}/{proto}', 'comment', BUTLER_TAG))
+
+    # Не добавляем общий deny: default deny incoming закрывает незаявленные
+    # сервисы, а общий deny выше SSH мог бы отрезать администратора при сбое.
+    # Опубликованные Docker-порты закрывает ufw-docker ниже.
+    return _supplement_unmanaged_docker_denies(commands), 'whitelist', skipped
+
+
+def _docker_published_host_ports() -> set[int]:
+    """Хост-порты из `docker ps` (0.0.0.0:8020->...). Без Docker — пусто."""
+    docker = shutil.which('docker') or '/usr/bin/docker'
+    ok, out = _try_command([docker, 'ps', '--format', '{{.Ports}}'], timeout=15)
+    if not ok or not out:
+        return set()
+    ports: set[int] = set()
+    for chunk in out.replace('\n', ',').split(','):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = re.search(r':(\d+)->', chunk)
+        if m:
+            ports.add(int(m.group(1)))
+    return ports
+
+
+def _supplement_unmanaged_docker_denies(commands: list) -> list:
+    """Добавить deny для опубликованных Docker-портов, не заведённых как сервис."""
+    managed = {port for port, _ in _iter_service_specs()}
+    protected = _protected_ports()
+    extra: list = []
+    for pub in sorted(_docker_published_host_ports()):
+        if pub in managed or pub in protected:
+            continue
+        extra.append(_ufw_cmd('deny', f'{pub}/tcp', 'comment', BUTLER_TAG))
+        extra.append(_ufw_cmd('deny', f'{pub}/udp', 'comment', BUTLER_TAG))
+    return commands + extra
+
+
+def _with_insert(cmd: list, position: int = 1) -> list:
+    """sudo -n ufw allow ... → sudo -n ufw insert 1 allow ...
+
+    Без insert новые правила попадают в КОНЕЦ user-цепочки. Тогда чужой
+    `allow from 192.168.100.0/24 to any` срабатывает раньше butler-deny,
+    и весь LAN проходит в сервис, хотя в белом списке один IP.
+    """
+    return [*cmd[:3], 'insert', str(position), *cmd[3:]]
+
+
+def _ufw_args(cmd: list) -> list:
+    """Аргументы ufw без префикса sudo -n <path>."""
+    return cmd[3:]
+
+
+def _is_global_inbound_deny(cmd: list) -> bool:
+    """deny in from any to any — блокирует ВСЁ входящее, в т.ч. SSH."""
+    args = _ufw_args(cmd)
+    return (
+        len(args) >= 6
+        and args[0] == 'deny'
+        and args[1] == 'in'
+        and args[2] == 'from'
+        and args[3] == 'any'
+        and args[4] == 'to'
+        and args[5] == 'any'
+    )
+
+
+def _apply_butler_ufw_commands(commands: list) -> None:
+    """Применить правила: строгий порядок как в предпросмотре (первое совпадение).
+
+    UFW на Astra не принимает ``insert N``, если правила с номером N ещё нет.
+    Вставляем каждое правило в позицию 1, но обходим список с конца: итоговый
+    порядок остаётся таким же, как в предпросмотре, а команда корректна даже
+    для пустого UFW.
+    """
+    for cmd in reversed(_compact_rules(commands)):
+        inserted = _with_insert(cmd, 1)
+        run_command(inserted, f'Не удалось применить правило: {" ".join(inserted[1:])}')
+
+
+def _compact_rules(commands):
+    """UFW multiport accepts 15 ports; combine only identical access conditions."""
+    groups = {}
+    for command in commands:
+        args = command[3:]
+        if '/' in args[1]:
+            port, proto = args[1].split('/')
+            key = (args[0], 'any', proto)
+        else:
+            port = args[args.index('port') + 1]
+            key = (args[0], args[args.index('from') + 1], args[args.index('proto') + 1])
+        groups.setdefault(key, set()).add(int(port))
+    result = []
+    # All source-specific allows must precede their port denies.
+    for (action, source, proto), ports in sorted(groups.items(), key=lambda item: item[0][0] != 'allow'):
+        ports = sorted(ports)
+        for offset in range(0, len(ports), 15):
+            chunk = ','.join(map(str, ports[offset:offset + 15]))
+            if source == 'any':
+                result.append(_ufw_cmd(action, f'{chunk}/{proto}', 'comment', BUTLER_TAG))
+            else:
+                result.append(_ufw_cmd(action, 'from', source, 'to', 'any', 'port', chunk,
+                                       'proto', proto, 'comment', BUTLER_TAG))
+    return result
+
+
+def _exclusive_apply(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        import fcntl
+        path = Path(current_app.config['DATABASE']).resolve().with_suffix('.apply.lock')
+        with path.open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('Правила уже применяются. Дождитесь завершения.')
+            try:
+                return function(*args, **kwargs)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    return wrapped
+
+
+def list_broad_allow_rules() -> list[str]:
+    """Чужие UFW-правила вида «ALLOW from подсети/IP на Anywhere» (любой порт).
+
+    Они перекрывают whitelist, если стоят выше deny. После apply Butler
+    вставляет свои правила в позицию 1, но предупреждение всё равно полезно.
+    """
+    ok, out = _try_command(_ufw_cmd('status', 'numbered'))
+    if not ok:
+        return []
+    found = []
+    for line in out.splitlines():
+        if f'# {BUTLER_TAG}' in line:
+            continue
+        # "[ 1] Anywhere  ALLOW IN  192.168.100.0/24"
+        # "[ 2] Anywhere on wlo1  ALLOW IN  192.168.100.0/24"
+        m = re.match(
+            r'\s*\[\s*\d+\s*\]\s+(Anywhere(?:\s+on\s+\S+)?)\s+ALLOW IN\s+(\S+)',
+            line,
+        )
+        if m:
+            found.append(line.strip())
+    return found
+
+
+def _parse_ufw_numbered_rules() -> list[dict]:
+    """Разобрать ``ufw status numbered`` в список правил по возрастанию номера."""
+    ok, out = _try_command(_ufw_cmd('status', 'numbered'))
+    if not ok:
+        return []
+    rules = []
+    for line in out.splitlines():
+        m = re.match(
+            r'\s*\[\s*(\d+)\s*\]\s+(.+?)\s+(ALLOW|DENY|REJECT)\s+IN\s+(.+?)(?:\s+#\s*(.*))?$',
+            line,
+        )
+        if not m:
+            continue
+        rules.append({
+            'num': int(m.group(1)),
+            'to': m.group(2).strip(),
+            'action': m.group(3),
+            'from': m.group(4).strip(),
+            'comment': (m.group(5) or '').strip(),
+            'raw': line.strip(),
+        })
+    return sorted(rules, key=lambda r: r['num'])
+
+
+def _ufw_rule_matches(rule: dict, src_ip: str, port: int, proto: str) -> bool:
+    """Грубая проверка: правило UFW относится к входящему src→port/proto."""
+    to_field = rule['to']
+    from_field = rule['from']
+    if from_field not in ('Anywhere', 'Anywhere (v6)') and from_field != src_ip:
+        try:
+            net = ipaddress.ip_network(from_field, strict=False)
+            if ipaddress.ip_address(src_ip) not in net:
+                return False
+        except ValueError:
+            return False
+    if to_field in ('Anywhere', 'Anywhere (v6)'):
+        return True
+    if f'{port}/{proto}' in to_field.replace(' ', ''):
+        return True
+    if to_field.startswith(f'{port}/'):
+        return True
+    return False
+
+
+def diagnose_port_access(port: int, src_ip: str, proto: str = 'tcp') -> dict:
+    """Почему с src_ip не открывается port — UFW, сервис в БД, listen, Docker."""
+    proto = (proto or 'tcp').lower()
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    try:
+        ipaddress.ip_address(src_ip)
+    except ValueError:
+        warnings.append(f'Некорректный IP клиента: {src_ip}')
+        src_ip = src_ip.strip()
+
+    db = get_db()
+    svc_rows = db.execute(
+        'SELECT name, port, ports_raw, protocol FROM services WHERE port = ? OR ports_raw LIKE ?',
+        (port, f'%{port}%'),
+    ).fetchall()
+    managed_specs = list(_iter_service_specs())
+    managed_ports = {p for p, _ in managed_specs}
+    in_butler = port in managed_ports
+
+    if not svc_rows:
+        lines.append(f'В Butler нет сервиса с портом {port} — UFW закроет его (catch-all / Docker deny).')
+    else:
+        names = ', '.join(r['name'] for r in svc_rows)
+        lines.append(f'Сервис в Butler: {names} (порт {port}).')
+
+    wl_rows = db.execute(
+        'SELECT ip_address FROM whitelist_entries WHERE enabled = 1'
+    ).fetchall()
+    wl_ips, _ = _collect_ips(wl_rows)
+    on_whitelist = False
+    for wip in wl_ips:
+        try:
+            net = ipaddress.ip_network(wip, strict=False)
+            if ipaddress.ip_address(src_ip) in net:
+                on_whitelist = True
+                break
+        except ValueError:
+            if wip == src_ip:
+                on_whitelist = True
+                break
+    if on_whitelist:
+        lines.append(f'IP {src_ip} есть в белом списке.')
+    else:
+        warnings.append(f'IP {src_ip} НЕ в белом списке — доступ к сервисам Butler запрещён.')
+
+    if in_butler and on_whitelist:
+        expected = 'ALLOW (ожидается доступ)'
+    elif in_butler:
+        expected = 'DENY (нет в whitelist)'
+    else:
+        expected = 'DENY (порт не заведён как сервис)'
+    lines.append(f'Ожидание UFW для {src_ip} → {port}/{proto}: {expected}')
+
+    ufw_rules = _parse_ufw_numbered_rules()
+    port_rules = [r for r in ufw_rules if _ufw_rule_matches(r, src_ip, port, proto)]
+    first = None
+    for r in ufw_rules:
+        if _ufw_rule_matches(r, src_ip, port, proto):
+            first = r
+            break
+    if not ufw_rules:
+        warnings.append('Не удалось прочитать ufw status numbered (нет sudo?).')
+    elif first:
+        lines.append(
+            f'Первое срабатывающее правило UFW: [{first["num"]}] {first["action"]} '
+            f'({first["to"]} from {first["from"]}) {first["comment"]!r}'
+        )
+        if first['action'] == 'DENY' and in_butler and on_whitelist:
+            warnings.append(
+                'UFW режет доступ, хотя сервис и whitelist настроены — '
+                'часто deny стоит ВЫШЕ allow (нажмите «Применить правила» после обновления).'
+            )
+    else:
+        lines.append('Нет явного правила UFW для этого порта — сработает default deny incoming.')
+
+    if port_rules:
+        lines.append('Все правила UFW, затрагивающие этот порт и IP (по номеру):')
+        for r in port_rules[:25]:
+            lines.append(f'  [{r["num"]}] {r["action"]} {r["to"]} from {r["from"]} # {r["comment"]}')
+        if len(port_rules) > 25:
+            lines.append(f'  … ещё {len(port_rules) - 25}')
+
+    ss = shutil.which('ss') or '/usr/sbin/ss'
+    ok_ss, out_ss = _try_command(['ss', '-tlnp'], timeout=10)
+    if proto == 'tcp' and ok_ss:
+        listening = [ln for ln in out_ss.splitlines() if f':{port} ' in ln or f':{port}\n' in ln]
+        if listening:
+            lines.append('Слушает на хосте (ss): ' + '; '.join(listening[:3]))
+        else:
+            warnings.append(
+                f'На хосте нет LISTEN на {port}/tcp (не Docker-proxy) — '
+                'фаервол тут ни при чём, процесс не слушает порт.'
+            )
+
+    docker_ports = _docker_published_host_ports()
+    if port in docker_ports:
+        lines.append(
+            f'Порт {port} опубликован Docker — UFW allow/deny на этот порт почти не влияет '
+            '(см. доку Docker). Решает DOCKER-USER + ctorigdstport.'
+        )
+        if not in_butler:
+            warnings.append('Порт в Docker, но не в списке сервисов Butler — должен быть закрыт снаружи.')
+        from .ufw_docker import _ufw_docker_block_present
+        if not _ufw_docker_block_present():
+            warnings.append(
+                'Блок ufw-docker не найден в /etc/ufw/after.rules — Apply не выполнил install '
+                'или нет sudo на .butler/bin/ufw-docker.'
+            )
+        else:
+            lines.append('ufw-docker: блок BEGIN UFW AND DOCKER в after.rules установлен.')
+    elif docker_ports:
+        lines.append(f'Другие опубликованные Docker-порты: {sorted(docker_ports)[:12]}…')
+
+    broad = list_broad_allow_rules()
+    if broad:
+        warnings.append(
+            'Есть широкие ALLOW (вся подсеть на любой порт) — см. предупреждение на странице фаервола.'
+        )
+
+    return {
+        'port': port,
+        'src_ip': src_ip,
+        'proto': proto,
+        'summary': '\n'.join(lines),
+        'warnings': warnings,
+    }
 
 
 def build_rules() -> tuple[str, str, list]:
@@ -191,6 +506,7 @@ def build_rules() -> tuple[str, str, list]:
     lines = [f'# Butler UFW rules  (режим: {mode})']
     if skipped:
         lines.append('# Пропущены некорректные адреса: ' + ', '.join(skipped))
+    lines.append('# Применяются через ufw insert (блок butler выше чужих LAN-allow).')
     lines.append('')
     lines.append('# --- защищённые порты (никогда не блокируются) ---')
     lines.append(f'ufw allow {SSH_PORT}/tcp                    # SSH')
@@ -248,34 +564,39 @@ def _list_butler_rule_numbers() -> list[int]:
     return sorted(numbers, reverse=True)
 
 
+def _delete_tagged_rules(tag):
+    # One saved rule deletes both address families. Works even while UFW is inactive.
+    result = run_command(_ufw_cmd('show', 'added'), 'Не удалось прочитать правила UFW:')
+    rules = []
+    for line in result.stdout.splitlines():
+        if not line.strip().startswith('ufw '):
+            continue
+        args = shlex.split(line.strip())[1:]
+        if 'comment' in args and args[args.index('comment') + 1] == tag:
+            rules.append(args)
+    for args in reversed(rules):
+        if args[0] == 'route':
+            command = _ufw_cmd('--force', 'route', 'delete', *args[1:])
+        else:
+            command = _ufw_cmd('--force', 'delete', *args)
+        run_command(command, 'Не удалось удалить прежнее правило Butler:')
+    return len(rules)
+
+
 def _delete_butler_rules() -> int:
-    """Удалить все правила с комментарием butler. Вернуть число удалённых."""
-    deleted = 0
-    # Перечитываем нумерацию после каждого удаления, чтобы не промахнуться.
-    while True:
-        numbers = _list_butler_rule_numbers()
-        if not numbers:
-            break
-        num = numbers[0]  # самый большой номер
-        ok, _out = _try_command(_ufw_cmd('--force', 'delete', str(num)))
-        if not ok:
-            break
-        deleted += 1
-        # Предохранитель от бесконечного цикла.
-        if deleted > 10000:
-            break
-    return deleted
+    return _delete_tagged_rules(BUTLER_TAG)
 
 
 def _ensure_enabled_and_protected() -> None:
-    """Гарантировать безопасные дефолты: UFW включён, SSH + порт Butler разрешены,
-    глобальная политика — deny incoming / allow outgoing.
+    """Подготовить безопасные дефолты: SSH + панель разрешены, политика UFW —
+    deny incoming / allow outgoing. Сам UFW включается только после успешной
+    установки правил Butler.
 
     ВАЖНО: не используем reset/disable. Порядок критичен для защиты от self-lockout:
       1. СНАЧАЛА явно allow на SSH (22) и порт панели — до смены default policy.
       2. ЗАТЕМ default deny incoming / allow outgoing (чтобы whitelist без сервисов
          реально закрывал остальное, а не оставлял всё открытым).
-      3. ПОСЛЕ этого enable, если UFW был неактивен.
+      3. Только после установки правил включить UFW.
 
     `ufw allow` и `ufw default` идемпотентны — повторный вызов ничего не ломает.
     """
@@ -290,14 +611,20 @@ def _ensure_enabled_and_protected() -> None:
 
     # Шаг 2. Безопасные дефолтные политики. Даже при пустом списке сервисов
     # входящий трафик будет закрыт (кроме явно разрешённых 22 и порта панели).
-    run_command(_ufw_cmd('default', 'deny', 'incoming'),
-                'Не удалось задать default deny incoming:')
-    run_command(_ufw_cmd('default', 'allow', 'outgoing'),
-                'Не удалось задать default allow outgoing:')
+    cat = shutil.which('cat') or '/usr/bin/cat'
+    ok, defaults = _try_command(['sudo', '-n', cat, '/etc/default/ufw'])
+    if not ok or not re.search(r'^DEFAULT_INPUT_POLICY="DROP"$', defaults, re.M):
+        run_command(_ufw_cmd('default', 'deny', 'incoming'),
+                    'Не удалось задать default deny incoming:')
+    if not ok or not re.search(r'^DEFAULT_OUTPUT_POLICY="ACCEPT"$', defaults, re.M):
+        run_command(_ufw_cmd('default', 'allow', 'outgoing'),
+                    'Не удалось задать default allow outgoing:')
 
-    # Шаг 3. Включаем UFW, если он ещё не активен. --force не задаёт вопросов.
+def _enable_ufw_if_needed() -> None:
+    """Включить UFW после успешной подготовки правил; Astra локализует status."""
     ok, out = _try_command(_ufw_cmd('status'))
-    if ok and 'Status: active' not in out:
+    active = 'Status: active' in out or 'Состояние: активен' in out
+    if ok and not active:
         run_command(_ufw_cmd('--force', 'enable'),
                     'Не удалось включить UFW:')
 
@@ -306,11 +633,12 @@ def _ensure_enabled_and_protected() -> None:
 # Публичный API — apply / reset
 # ---------------------------------------------------------------------------
 
+@_exclusive_apply
 def apply_firewall_rules() -> tuple[Path, None, None]:
     """Идемпотентно применить правила Butler через UFW.
 
     Порядок:
-      1. Гарантировать, что SSH и порт Butler разрешены, UFW включён.
+      1. Гарантировать, что SSH и порт Butler разрешены.
       2. Удалить прежние правила Butler (по comment 'butler').
       3. Добавить актуальный набор правил из БД.
 
@@ -319,20 +647,89 @@ def apply_firewall_rules() -> tuple[Path, None, None]:
     """
     generated_file = write_generated_rules_file()
 
-    # Шаг 1 — защита критичных портов и активация.
+    # Шаг 1 — защита критичных портов. UFW ещё выключен, если до этого был inactive.
     _ensure_enabled_and_protected()
 
     # Шаг 2 — снять прежние правила Butler.
     _delete_butler_rules()
 
-    # Шаг 3 — применить актуальные правила.
+    # Шаг 3 — allow/deny в начало; catch-all — сразу после блока butler (выше LAN-allow).
     commands, _mode, _skipped = _rule_commands()
-    for cmd in commands:
-        run_command(cmd, f'Не удалось применить правило: {" ".join(cmd[1:])}')
+    _apply_butler_ufw_commands(commands)
+
+    # Шаг 4 — включить только после успешного построения набора правил.
+    _enable_ufw_if_needed()
+
+    # Host established-flow policy + Docker forwarding policy.
+    _apply_docker_isolation()
+
+    # Existing inbound packets now traverse policy rules too (before.rules and
+    # DOCKER-USER). Do not delete conntrack: TCP loose pickup can recreate a
+    # flow in reverse direction from a server retransmission, bypassing policy.
 
     return generated_file, None, None
 
 
+def _revoked_flows(output, local_addresses, specs, whitelist, protected):
+    """Original conntrack tuples include the published port before Docker DNAT."""
+    for line in output.splitlines():
+        protocol = re.search(r'\b(tcp|udp)\s+\d+\s', line)
+        original = re.search(r'src=(\S+) dst=(\S+) sport=(\d+) dport=(\d+)', line)
+        if not protocol or not original:
+            continue
+        src, dst, sport, dport = original.groups()
+        try:
+            source = ipaddress.ip_address(src)
+            destination = ipaddress.ip_address(dst)
+        except ValueError:
+            continue
+        port = int(dport)
+        if str(destination) not in local_addresses or port in protected:
+            continue
+        if source.is_loopback or str(source) in local_addresses:
+            continue
+        proto = protocol.group(1)
+        allowed = (port, proto) in specs and (
+            not whitelist or any(source in network for network in whitelist))
+        if not allowed:
+            yield proto, str(source), str(destination), sport, dport
+
+
+def _drop_service_connections() -> None:
+    """Revoke inbound flows denied by the new policy, including deleted services."""
+    conntrack = shutil.which('conntrack') or '/usr/sbin/conntrack'
+    ip = shutil.which('ip') or '/usr/sbin/ip'
+    ok, addresses = _try_command([ip, '-j', 'address', 'show'])
+    if not ok:
+        raise RuntimeError('Не удалось определить адреса сервера для закрытия соединений.')
+    local_addresses = {
+        str(ipaddress.ip_address(addr['local']))
+        for interface in json.loads(addresses)
+        for addr in interface.get('addr_info', []) if 'local' in addr
+    }
+    rows = get_db().execute(
+        'SELECT ip_address FROM whitelist_entries WHERE enabled = 1').fetchall()
+    ips, invalid = _collect_ips(rows)
+    if invalid:
+        raise ValueError('Некорректные адреса белого списка.')
+    whitelist = [ipaddress.ip_network(value) for value in ips]
+    specs = set(_iter_service_specs())
+    for family in ('ipv4', 'ipv6'):
+        result = run_command(
+            ['sudo', '-n', conntrack, '-L', '-f', family, '-o', 'extended'],
+            'Не удалось проверить существующие соединения:', timeout=30)
+        for proto, src, dst, sport, dport in _revoked_flows(
+                result.stdout, local_addresses, specs, whitelist, _protected_ports()):
+            command = ['sudo', '-n', conntrack, '-D', '-f', family, '-p', proto,
+                       '--orig-src', src, '--orig-dst', dst,
+                       '--sport', sport, '--dport', dport]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+            # conntrack returns 1 when the connection has already disappeared.
+            if result.returncode not in (0, 1):
+                raise RuntimeError('Не удалось закрыть запрещённое соединение: ' + result.stderr)
+
+
+@_exclusive_apply
 def reset_firewall_rules() -> tuple[None, None]:
     """Убрать ТОЛЬКО правила Butler, не трогая остальную конфигурацию UFW.
 
@@ -341,6 +738,31 @@ def reset_firewall_rules() -> tuple[None, None]:
     """
     # Гарантируем, что критичные порты открыты (на случай если их не было).
     _ensure_enabled_and_protected()
+    _enable_ufw_if_needed()
     # Удаляем только помеченные Butler правила.
     _delete_butler_rules()
+    _reset_docker_isolation()
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Docker — bundled ufw-docker (https://github.com/chaifeng/ufw-docker)
+# ---------------------------------------------------------------------------
+
+
+def _apply_docker_isolation() -> None:
+    """ufw-docker install + ufw route allow только для whitelist (см. app/ufw_docker.py)."""
+    docker = shutil.which('docker') or '/usr/bin/docker'
+    ok, _ = _try_command([docker, 'info'], timeout=10)
+    if not ok:
+        if Path(docker).exists():
+            raise RuntimeError('Docker недоступен: правила контейнеров не применены.')
+        return
+    from .ufw_docker import sync_docker_whitelist_from_db
+    sync_docker_whitelist_from_db()
+
+
+def _reset_docker_isolation() -> None:
+    """Убрать ufw route правила Butler для Docker (блок after.rules не трогаем)."""
+    from .ufw_docker import delete_butler_docker_routes
+    delete_butler_docker_routes()

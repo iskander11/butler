@@ -5,6 +5,20 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolate_system_commands(monkeypatch):
+    """Unit tests must never change the machine's actual firewall."""
+    import subprocess
+    import app.firewall as fw
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('System commands must be explicitly mocked in unit tests')
+
+    monkeypatch.setattr(subprocess, 'run', forbidden)
+    monkeypatch.setattr(fw, '_docker_published_host_ports', lambda: set())
+    monkeypatch.setattr(fw, '_try_command', lambda *args, **kwargs: (True, 'Status: active'))
+
+
 @pytest.fixture
 def app(tmp_path):
     db_path = str(tmp_path / 'test.sqlite3')

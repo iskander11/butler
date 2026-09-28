@@ -28,15 +28,6 @@ CREATE TABLE IF NOT EXISTS whitelist_entries (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS blacklist_entries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ip_address TEXT NOT NULL,
-    reason TEXT,
-    comment TEXT,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
 CREATE TABLE IF NOT EXISTS attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ip_address TEXT NOT NULL,
@@ -169,13 +160,6 @@ def seed_demo_data():
             ('10.10.10.10', 'Тестовый клиент', 'Разрешен для проверки интерфейса')
         )
 
-    blacklist_count = db.execute('SELECT COUNT(*) AS count FROM blacklist_entries').fetchone()['count']
-    if blacklist_count == 0:
-        db.execute(
-            'INSERT INTO blacklist_entries (ip_address, reason, comment) VALUES (?, ?, ?)',
-            ('11.11.11.11', 'Ручная блокировка', 'Тестовая запись в черном списке')
-        )
-
     mode_exists = db.execute("SELECT COUNT(*) AS count FROM settings WHERE key = 'firewall_mode'").fetchone()['count']
     if mode_exists == 0:
         db.execute("INSERT INTO settings (key, value) VALUES ('firewall_mode', 'whitelist')")
@@ -191,10 +175,8 @@ def init_app(app):
         db.executescript(SCHEMA_SQL)
         db.commit()
         migrate_db(db)
-        seed_demo_data()
 
     @app.cli.command('init-db')
     def init_db_command():
         init_db()
-        seed_demo_data()
-        print('Database initialized and demo data added.')
+        print('Database initialized.')

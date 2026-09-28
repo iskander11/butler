@@ -8,8 +8,8 @@
             <h2>Панель управления</h2>
             <p>Централизованный контроль доступа к сервисам сервера.</p>
         </div>
-        <div class="mode-badge {% if mode == 'whitelist' %}mode-badge-whitelist{% else %}mode-badge-blacklist{% endif %}">
-            Режим: {{ 'белый список' if mode == 'whitelist' else 'чёрный список' }}
+        <div class="mode-badge mode-badge-whitelist">
+            Режим: белый список
         </div>
     </div>
 </section>
@@ -23,15 +23,10 @@
         <h3>Попыток</h3>
         <p class="stat-number">{{ stats.attempts }}</p>
     </article>
-    <article class="stat-card {% if mode == 'whitelist' %}stat-card-active{% endif %}">
+    <article class="stat-card stat-card-active">
         <h3>Белый список</h3>
         <p class="stat-number">{{ stats.whitelist }}</p>
-        {% if mode == 'whitelist' %}<p class="stat-mode-label">активен</p>{% endif %}
-    </article>
-    <article class="stat-card {% if mode == 'blacklist' %}stat-card-active{% endif %}">
-        <h3>Чёрный список</h3>
-        <p class="stat-number">{{ stats.blacklist }}</p>
-        {% if mode == 'blacklist' %}<p class="stat-mode-label">активен</p>{% endif %}
+        <p class="stat-mode-label">активен</p>
     </article>
 </div>
 {% endblock %}

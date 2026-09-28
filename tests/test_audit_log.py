@@ -41,16 +41,10 @@ def test_audit_log_records_whitelist_add(auth_client, app):
         assert len(entries) > 0
 
 
-def test_audit_log_records_mode_change(auth_client, app):
-    """11.1 — смена режима фиксируется в журнале."""
-    post(auth_client, '/settings/firewall-mode', data={'mode': 'blacklist'}, follow_redirects=True)
-
-    with app.app_context():
-        from app.db import get_db
-        entries = get_db().execute(
-            "SELECT * FROM audit_log WHERE action LIKE '%mode%' OR target_value LIKE '%blacklist%'"
-        ).fetchall()
-        assert len(entries) > 0
+def test_audit_log_records_apply_not_mode(auth_client, app):
+    """Смена режима удалена — в журнале её больше нет как UI-действия."""
+    r = post(auth_client, '/settings/firewall-mode', data={'mode': 'blacklist'})
+    assert r.status_code == 404
 
 
 def test_audit_log_persists_after_restart(app):

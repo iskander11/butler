@@ -1,0 +1,1178 @@
+#!/bin/bash
+set -euo pipefail
+[[ -n "${DEBUG:-}" ]] && set -x
+
+# UFW-DOCKER GLOBAL VARIABLES START #
+LC_ALL=C
+PATH="/bin:/usr/bin:/sbin:/usr/sbin:/snap/bin/"
+
+GREP_REGEXP_NAME="[-_.[:alnum:]]\\+"
+DEFAULT_PROTO=tcp
+ENV_VALUE_SPLITTER=','
+
+ufw_docker_agent=ufw-docker-agent
+ufw_docker_agent_image="${UFW_DOCKER_AGENT_IMAGE:-chaifeng/${ufw_docker_agent}:251123-nf_tables}"
+ufw_docker_agent_image_probe_error=''
+
+after_rules="/etc/ufw/after.rules"
+after6_rules="/etc/ufw/after6.rules"
+
+bin_location="/usr/local/bin/ufw-docker"
+man_location="/usr/local/man/man8/ufw-docker.8"
+ufw_docker_service_file="/etc/systemd/system/ufw-docker.service"
+
+# UFW-DOCKER GLOBAL VARIABLES END #
+
+function ufw-docker--status() {
+    ufw-docker--list
+}
+
+function ufw-docker--list() {
+    local INSTANCE_NAME="${1:-}"
+    local INSTANCE_PORT="${2:-}"
+    local PROTO="${3:-}"
+    local NETWORK="${4:-}"
+    local params_count="$#"
+    local _grep_regexp
+
+    [[ -n "${INSTANCE_NAME:-}" ]] || INSTANCE_NAME="$GREP_REGEXP_NAME"
+    if [[ -z "${INSTANCE_PORT:-}" && -z "${PROTO:-}" && -z "${NETWORK-}" ]]; then
+        INSTANCE_PORT="[[:digit:]]\\+"
+        [[ -n "${PROTO:-}" ]] || PROTO="\\(tcp\\|udp\\)"
+        _grep_regexp="\\( ${INSTANCE_PORT}/${PROTO}\\( ${GREP_REGEXP_NAME}\\)\\?\\)\\?"
+    else
+        [[ -n "${INSTANCE_PORT:-}" ]] || INSTANCE_PORT="[[:digit:]]\\+"
+        [[ -n "${PROTO:-}" ]] || PROTO="${DEFAULT_PROTO}"
+        if [[ -n "${NETWORK:-}" ]]; then
+            NETWORK=" ${NETWORK}"
+        else
+            NETWORK="\\( ${GREP_REGEXP_NAME}\\)\\?"
+        fi
+        _grep_regexp=" ${INSTANCE_PORT}/${PROTO}${NETWORK}"
+    fi
+
+    local ufw_output
+    ufw_output="$(ufw status numbered)"
+
+    grep "# allow ${INSTANCE_NAME}\\(/v6\\)\\?${_grep_regexp}\$" <<< "$ufw_output"
+}
+
+function ufw-docker--list-number() {
+    ufw-docker--list "$@" | sed -e 's/^\[[[:blank:]]*\([[:digit:]]\+\)\].*/\1/'
+}
+
+function ufw-docker--delete() {
+    for UFW_NUMBER in $(ufw-docker--list-number "$@" | sort -rn); do
+        echo "delete \"$UFW_NUMBER\""
+        echo y | ufw delete "$UFW_NUMBER" || true
+    done
+}
+
+function ufw-docker--allow() {
+    local INSTANCE_NAME="$1"
+    local INSTANCE_PORT="$2"
+    local PROTO="$3"
+    local NETWORK="${4:-}"
+    local NETWORK_ADDRESSES PORT_PROTO_LIST PROT_PROTO IP SUFFIX
+
+    docker inspect "$INSTANCE_NAME" &>/dev/null ||
+        die "Docker instance \"$INSTANCE_NAME\" doesn't exist."
+
+    mapfile -t NETWORK_ADDRESSES < <(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{if $net.IPAddress|len}}{{$name}} {{$net.IPAddress}}{{"\n"}}{{end}}{{if $net.GlobalIPv6Address|len}}{{$name}} {{$net.GlobalIPv6Address}}{{"\n"}}{{end}}{{end}}' "$INSTANCE_NAME" 2>/dev/null | remove_blank_lines)
+
+    [[ -z "${NETWORK_ADDRESSES:-}" ]] && die "Could not find a running instance \"$INSTANCE_NAME\"."
+
+    mapfile -t PORT_PROTO_LIST < <(docker inspect --format='{{range $p, $conf := .NetworkSettings.Ports}}{{with $conf}}{{$p}}{{"\n"}}{{end}}{{end}}' "$INSTANCE_NAME" | remove_blank_lines)
+
+    if [[ -z "${PORT_PROTO_LIST:-}" ]]; then
+        err "\"$INSTANCE_NAME\" doesn't have any published ports."
+        return 1
+    fi
+
+    local count=0
+    for PORT_PROTO in "${PORT_PROTO_LIST[@]}"; do
+        if [[ -z "$INSTANCE_PORT" || "$PORT_PROTO" = "${INSTANCE_PORT}/${PROTO}" ]]; then
+            for item in "${NETWORK_ADDRESSES[@]}"; do
+                INSTANCE_NETWORK="${item% *}"
+                IP="${item#* }"
+                if [[ -n "$NETWORK" ]] && [[ "$NETWORK" != "$INSTANCE_NETWORK" ]]; then
+                    continue
+                fi
+                if [[ "$IP" = *:* ]]; then SUFFIX="/v6"; else SUFFIX=""; fi
+                ufw-docker--add-rule "${INSTANCE_NAME}${SUFFIX}" "$IP" "${PORT_PROTO%/*}" "${PORT_PROTO#*/}" "${INSTANCE_NETWORK}"
+                (( ++count ))
+            done
+        fi
+    done
+    if [[ "$count" -eq 0 ]]; then
+        err "Fail to add rule(s), cannot find the published port ${INSTANCE_PORT}/${PROTO} of instance \"${INSTANCE_NAME}\" or cannot update outdated rule(s)."
+        return 1
+    fi
+    return 0
+}
+
+function ufw-docker--add-service-rule() {
+    declare service_id="$1"
+    declare port="${2%/*}"
+    declare proto="${2#*/}"
+
+    declare target_ip_port
+    target_ip_port="$(iptables -t nat -L DOCKER-INGRESS | grep -E "^DNAT\\s+${proto}\\s+.+\\sto:[.0-9]+:${port}\$" | grep -Eo "[.0-9]+:${port}\$")"
+
+    [[ -z "$target_ip_port" ]] && die "Could not find VIP of service ${service_id}."
+
+    ufw-docker--add-rule "$service_id" "${target_ip_port%:*}" "$port" "$proto"
+}
+
+function ufw-docker--add-rule() {
+    local INSTANCE_NAME="$1"
+    local INSTANCE_IP_ADDRESS="$2"
+    local PORT="$3"
+    local PROTO="$4"
+    local NETWORK="${5:-}"
+
+    declare comment
+
+    echo "allow ${INSTANCE_NAME} ${PORT}/${PROTO} ${NETWORK}"
+    typeset -a UFW_OPTS
+    UFW_OPTS=(route allow proto "${PROTO}"
+              from any to "$INSTANCE_IP_ADDRESS")
+    comment="allow ${INSTANCE_NAME}"
+    [[ -n "$PORT" ]] && {
+        UFW_OPTS+=(port "${PORT}")
+        comment="$comment ${PORT}/${PROTO}"
+    }
+    [[ -n "$NETWORK" ]] && {
+        comment="$comment ${NETWORK}"
+    }
+    UFW_OPTS+=(comment "$comment")
+
+    if ufw-docker--list "$INSTANCE_NAME" "$PORT" "$PROTO" "$NETWORK" &>/dev/null; then
+        ufw --dry-run "${UFW_OPTS[@]}" | grep "^Skipping" && return 0
+        err "Remove outdated rule."
+        ufw-docker--delete "$INSTANCE_NAME" "$PORT" "$PROTO" "$NETWORK"
+    fi
+    echo ufw "${UFW_OPTS[@]}"
+    ufw "${UFW_OPTS[@]}"
+}
+
+function ufw-docker--instance-name() {
+    local INSTANCE_ID="$1"
+    {
+        {
+            docker inspect --format='{{.Name}}' "$INSTANCE_ID" 2>/dev/null | sed -e 's,^/,,' |
+                grep "^${GREP_REGEXP_NAME}\$" 2>/dev/null
+        } || echo -n "$INSTANCE_ID";
+    } | remove_blank_lines
+}
+
+function ufw-docker--service() {
+    declare service_action="${1:-help}"
+    case "$service_action" in
+        delete)
+            shift || true
+            if [[ "${1:?Invalid 'delete' command syntax.}" != "allow" ]]; then
+                die "\"delete\" command only support removing allowed rules"
+            fi
+            shift || true
+            declare service_id_or_name="${1:?Missing swarm service name or service ID}"
+
+            "ufw-docker--service-${service_action}" "$@"
+            ;;
+        allow)
+            shift || true
+            declare service_id_or_name="${1:?Missing swarm service name or service ID}"
+            declare service_port="${2:?Missing the port number, such as '80/tcp'.}"
+
+            "ufw-docker--service-${service_action}" "${service_id_or_name}" "${service_port}"
+            ;;
+        *)
+            ufw-docker--help
+            ;;
+    esac
+}
+
+function ufw-docker--get-service-id() {
+    declare service_name="$1"
+    docker service inspect "${service_name}" --format "{{.ID}}"
+}
+
+function ufw-docker--get-service-name() {
+    declare service_name="$1"
+    docker service inspect "${service_name}" --format "{{.Spec.Name}}"
+}
+
+function ufw-docker--list-service-ports() {
+    declare service_name="$1"
+    docker service inspect "$service_name" \
+           --format '{{range .Endpoint.Spec.Ports}}{{.PublishedPort}} {{.TargetPort}}/{{.Protocol}}{{"\n"}}{{end}}'
+}
+
+function ufw-docker--service-allow() {
+    declare service_name="$1"
+    declare service_port="$2"
+    declare service_proto=tcp
+
+    if [[ -n "$service_port" ]] &&
+           ! grep -E '^[0-9]+(/(tcp|udp))?$' <<< "$service_port" &>/dev/null; then
+        die "Invalid port syntax: $service_port"
+        return 1
+    fi
+
+    if [[ "$service_port" = */* ]]; then
+        service_proto="${service_port#*/}"
+        service_port="${service_port%/*}"
+    fi
+
+    declare service_id
+    service_id="$(ufw-docker--get-service-id "${service_name}")"
+    [[ -z "${service_id:-}" ]] && die "Could not find service \"$service_name\""
+    service_name="$(ufw-docker--get-service-name "${service_name}")"
+
+    declare env_value= published_port= target_port=
+    exec 9< <(ufw-docker--list-service-ports "$service_name")
+    while read -u 9 -r published_port target_port; do
+        if [[ "$target_port" = "${service_port}/${service_proto}" ]]; then
+            env_value="${service_name}/${published_port}/${service_proto}"
+            break;
+        fi
+    done
+    exec 9<&-
+
+    [[ -z "${env_value:-}" ]] && die "Service $service_name does not publish port $service_port."
+
+    if [[ "${ufw_docker_agent_image}" = *-@(legacy|nf_tables) ]]; then
+        ufw_docker_agent_image="$(ufw-docker--resolve-agent-image "${ufw_docker_agent_image}")"
+        test -n "$ufw_docker_agent_image"
+    fi
+
+    declare service_env
+    if ! docker service inspect "$ufw_docker_agent" &>/dev/null; then
+        err "Not found ufw-docker-agent service, creating ..."
+        service_env="ufw_public_${service_id}=${env_value}"
+        docker service create --name "$ufw_docker_agent" --mode global \
+               --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock \
+               --mount type=bind,source=/etc/ufw,target=/etc/ufw,readonly=true \
+               --env ufw_docker_agent_image="${ufw_docker_agent_image}" \
+               --env DEBUG="${DEBUG:-}" \
+               --env "${service_env}" \
+               "${ufw_docker_agent_image}"
+    else
+        declare -a value_list=() service_env_list=()
+        exec 8< <(ufw-docker--get-env-list)
+        while read -u 8 -r id value; do
+            [[ "$id" != "$service_id" && "$value" = "${service_name}"/* ]] && service_env_list+=(--env-rm "ufw_public_${id}")
+            [[ "$id" = "$service_id" ]] || continue
+            [[ "${value}" = "${env_value}" || "${value}" = "${env_value}"/* ]] ||
+                value_list+=("${value}")
+        done
+        exec 8<&-
+        value_list=("${env_value}" "${value_list[@]}")
+
+        service_env="ufw_public_${service_id}=$(IFS="${ENV_VALUE_SPLITTER}"; printf '%s' "${value_list[*]}")"
+
+        service_env_list+=(--env-add "${service_env}")
+
+        docker service update --update-parallelism=0 \
+               --env-add ufw_docker_agent_image="${ufw_docker_agent_image}" \
+               --env-add DEBUG="${DEBUG:-}" \
+               "${service_env_list[@]}" \
+               --image "${ufw_docker_agent_image}" \
+               "${ufw_docker_agent}"
+    fi
+}
+
+function ufw-docker--get-env-list() {
+    docker service inspect "${ufw_docker_agent}" \
+           --format '{{range $k,$v := .Spec.TaskTemplate.ContainerSpec.Env}}{{ $v }}{{"\n"}}{{end}}' |
+        sed -e '/^ufw_public_/!d' \
+            -e 's/^ufw_public_//' \
+            -e 's/=/ /' |
+        while read -r id value; do
+            tr ',' '\n' <<< "$value" | sed "s/^/${id} /g"
+        done
+}
+
+function ufw-docker--service-delete() {
+    declare service_name="$1"
+    declare service_port="${2:-}"
+    declare port proto
+
+    if [[ "${service_port:-}" = */* ]]; then
+        port="${service_port%/*}"
+        proto="${service_port#*/}"
+    elif [[ -n "${service_port:-}" ]]; then
+        port="$service_port"
+        proto="$DEFAULT_PROTO"
+    fi
+
+    declare service_id
+    service_id="$(ufw-docker--get-service-id "${service_name}")"
+    [[ -z "${service_id:-}" ]] && die "Could not find service \"$service_name\""
+    service_name="$(ufw-docker--get-service-name "${service_name}")"
+
+    declare env_value= published_port= target_port=
+    if [[ -n "${port:-}" ]]; then
+        exec 9< <(ufw-docker--list-service-ports "$service_name")
+        while read -u 9 -r published_port target_port; do
+            if [[ "$target_port" = "${port}/${proto}" ]]; then
+                env_value="${service_name}/${published_port}/${proto}"
+                break;
+            fi
+        done
+        exec 9<&-
+        [[ -n "${env_value:-}" ]] || die "Service $service_name does not publish port $service_port."
+    else
+        declare env_value="${service_name}"
+    fi
+
+    declare id value
+    declare -a value_list=()
+    exec 8< <(ufw-docker--get-env-list)
+    while read -u 8 -r id value; do
+        [[ "$id" = "$service_id" ]] || continue
+        [[ "${value}" = "${env_value}" || "${value}" = "${env_value}"/* ]] ||
+            value_list+=("${value}")
+    done
+    exec 8<&-
+    value_list=("${env_value}/deny" "${value_list[@]}")
+
+    declare service_env
+    service_env="ufw_public_${service_id}=$(IFS="${ENV_VALUE_SPLITTER}"; printf '%s' "${value_list[*]}")"
+
+    if [[ "${ufw_docker_agent_image}" = *-@(legacy|nf_tables) ]]; then
+        ufw_docker_agent_image="$(ufw-docker--resolve-agent-image "${ufw_docker_agent_image}")"
+        test -n "$ufw_docker_agent_image"
+    fi
+
+    docker service update --update-parallelism=0 \
+           --env-add ufw_docker_agent_image="${ufw_docker_agent_image}" \
+           --env-add "${service_env}" \
+           --env-add DEBUG="${DEBUG-}" \
+           --image "${ufw_docker_agent_image}" \
+           "${ufw_docker_agent}"
+}
+
+function ufw-docker--raw-command() {
+    ufw "$@"
+}
+
+function ufw-docker--check() {
+    # test $@ for the '--system' flag
+    local system_flag=false
+    for arg in "$@"; do
+        if [[ "$arg" == "--system" ]]; then
+            system_flag=true
+        else
+            new_args+=("$arg")
+        fi
+    done
+    set -- "${new_args[@]}"
+
+    err "\\n########## iptables -n -L DOCKER-USER ##########"
+    iptables -n -L DOCKER-USER
+
+    err "\\n\\n########## diff $after_rules ##########"
+    ufw-docker--check-install "$@" && err "\\nCheck IPv4 firewall rules done."
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        err "\\n########## ip6tables -n -L DOCKER-USER ##########"
+        ip6tables -n -L DOCKER-USER
+
+        err "\\n\\n########## diff $after6_rules ##########"
+        ufw-docker--check-install_ipv6 "$@" && err "\\nCheck IPv6 firewall rules done."
+    fi
+
+    if $system_flag; then
+        err "\\n\\n########## system install ##########"
+        err "Installing 'ufw-docker' to '${bin_location}'"
+        err "Installing man page to '${man_location}'"
+    fi
+}
+
+declare -a files_to_be_deleted
+
+function rm-on-exit() {
+    [[ $# -gt 0 ]] && files_to_be_deleted+=("$@")
+}
+
+function on-exit() {
+    for file in "${files_to_be_deleted[@]:-}"; do
+        [[ -f "$file" ]] && rm -r "$file"
+    done
+    files_to_be_deleted=()
+}
+
+trap on-exit EXIT INT TERM QUIT ABRT ERR
+
+function ufw-docker--list-docker-subnets() {
+    local ipversion="$1"
+    shift || true
+    if [[ -z "${1-}" ]]; then
+        docker network ls --format '{{.ID}}' |
+        while read -r net; do
+            docker network inspect "$net" --format '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}'
+        done
+    else
+        printf "%s\n" "$@"
+     fi |
+        while read -r cidr; do
+            if [[ "${ipversion}" = "IPv4" && "$cidr" = *.* ]] || [[ "${ipversion}" = "IPv6" && "$cidr" = *:* ]]
+            then echo "$cidr"
+            fi
+        done |
+        sort
+}
+
+function ufw-docker--check-install() {
+    declare -a cidr_list
+    declare cidr
+    if [[ -z "${1-}" ]]; then
+        cidr_list=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16)
+    elif [[ "${1-}" = '--docker-subnets' ]]; then
+        shift || true
+        mapfile -t cidr_list < <(ufw-docker--list-docker-subnets IPv4 "$@")
+    fi
+    if [[ -z "${cidr_list:-}" ]]; then
+        err "ERROR: Could not find any IPv4 subnets used by docker engine\n"
+        exit 1
+    fi
+
+    after_rules_tmp="${after_rules_tmp:-$(mktemp)}"
+    rm-on-exit "$after_rules_tmp"
+
+    sed "/^# BEGIN UFW AND DOCKER/,/^# END UFW AND DOCKER/d" "$after_rules" | tee "$after_rules_tmp" >/dev/null
+    {
+        cat <<-'EOF'
+	# BEGIN UFW AND DOCKER
+	*filter
+	:ufw-user-forward - [0:0]
+	:ufw-docker-logging-deny - [0:0]
+	:DOCKER-USER - [0:0]
+	-A DOCKER-USER -j ufw-user-forward
+
+	-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN
+	-A DOCKER-USER -m conntrack --ctstate INVALID -j DROP
+	-A DOCKER-USER -i docker0 -o docker0 -j ACCEPT
+
+	EOF
+
+        for cidr in "${cidr_list[@]}"; do
+	          echo "-A DOCKER-USER -j RETURN -s ${cidr}"
+        done
+
+        for cidr in "${cidr_list[@]}"; do
+	          echo "-A DOCKER-USER -j ufw-docker-logging-deny -m conntrack --ctstate NEW,ESTABLISHED -d ${cidr}"
+        done
+
+        cat <<-'EOF'
+
+	-A DOCKER-USER -j RETURN
+
+	-A ufw-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
+	-A ufw-docker-logging-deny -j DROP
+
+	COMMIT
+	# END UFW AND DOCKER
+	EOF
+    } | tee -a "${after_rules_tmp}" >/dev/null
+    diff -u --color=auto "$after_rules" "$after_rules_tmp"
+}
+
+function ufw-docker--check-install_ipv6() {
+    declare -a cidr6_list
+    declare cidr
+    if [[ -z "${1-}" ]]; then
+        cidr6_list=(fd00::/8)
+    elif [[ "${1-}" = '--docker-subnets' ]]; then
+        shift || true
+        mapfile -t cidr6_list < <(ufw-docker--list-docker-subnets IPv6 "$@")
+    fi
+    if [[ -z "${cidr6_list:-}" ]]; then
+        err "INFO: Could not find any IPv6 subnets used by docker engine, will disable IPv6 support.\n"
+        return 0
+    fi
+
+    after6_rules_tmp="${after6_rules_tmp:-$(mktemp)}"
+    rm-on-exit "$after6_rules_tmp"
+
+    sed "/^# BEGIN UFW AND DOCKER/,/^# END UFW AND DOCKER/d" "$after6_rules" | tee "$after6_rules_tmp" >/dev/null
+    {
+        cat <<-'EOF'
+	# BEGIN UFW AND DOCKER
+	*filter
+	:ufw6-user-forward - [0:0]
+	:ufw6-docker-logging-deny - [0:0]
+	:DOCKER-USER - [0:0]
+	-A DOCKER-USER -j ufw6-user-forward
+
+	-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN
+	-A DOCKER-USER -m conntrack --ctstate INVALID -j DROP
+	-A DOCKER-USER -i docker0 -o docker0 -j ACCEPT
+
+	EOF
+
+        for cidr in "${cidr6_list[@]}"; do
+	          echo "-A DOCKER-USER -j RETURN -s ${cidr}"
+        done
+
+        for cidr in "${cidr6_list[@]}"; do
+	          echo "-A DOCKER-USER -j ufw6-docker-logging-deny -m conntrack --ctstate NEW,ESTABLISHED -d ${cidr}"
+        done
+
+        cat <<-'EOF'
+
+	-A DOCKER-USER -j RETURN
+
+	-A ufw6-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
+	-A ufw6-docker-logging-deny -j DROP
+
+	COMMIT
+	# END UFW AND DOCKER
+	EOF
+    } | tee -a "${after6_rules_tmp}"
+    diff -u --color=auto "$after6_rules" "$after6_rules_tmp"
+}
+
+function ufw-docker--reload() {
+    local ufw_output
+    ufw_output="$(ufw-docker--list || true)"
+
+    [[ -z "$ufw_output" ]] && return 0
+
+    local comments
+    comments=$(sed -n 's/.*# allow //p' <<< "$ufw_output")
+
+    declare -A commands_map
+
+    while read -r line; do
+        [[ -z "$line" ]] && continue
+
+        read -r -a tokens <<< "$line"
+
+        local instance_name="${tokens[0]%/v6}"
+        local port=""
+        local proto=""
+        local network=""
+
+        for ((i=1; i<${#tokens[@]}; i++)); do
+            local token="${tokens[i]}"
+            if [[ "$token" =~ ^[0-9]+/(tcp|udp)$ ]]; then
+                port="${token%/*}"
+                proto="${token#*/}"
+            else
+                network="$token"
+            fi
+        done
+
+        local key="${instance_name}|${port}|${proto}|${network}"
+        echo "Reloading rule for $instance_name ${port}/${proto} $network" >&2
+        if ! (ufw-docker--allow "$instance_name" "$port" "$proto" "$network"); then
+            echo "Delete unexisting rule for $instance_name ${port}/${proto} $network" >&2
+            ufw-docker--delete "$instance_name" "$port" "$proto" "$network"
+        fi
+    done <<< "$comments"
+    local max_retries=10
+    echo "Waiting for ufw-docker agent to be recreated..." >&2
+    until docker ps --filter "name=$ufw_docker_agent" -q | xargs --no-run-if-empty -- docker rm -f; do
+        if ! ((max_retries--)); then
+            echo "Failed to recreate ufw-docker-agent service." >&2
+            exit 1
+        fi
+        echo "Waiting for ufw-docker agent to be recreated..." >&2
+        sleep 3
+    done
+}
+
+function ufw-docker--install() {
+    local changed=false
+    # Inbound established flows must obey current service policy. Replies to
+    # connections initiated by this server retain their normal fast path.
+    local before_file
+    for before_file in /etc/ufw/before.rules /etc/ufw/before6.rules; do
+        if grep -Eq '^-A ufw6?-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT$' "$before_file"; then
+            cp -p "$before_file" "${before_file}.butler-backup-$(date +%s)"
+            sed -i -E '/^-A ufw6?-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT$/s/ -j ACCEPT$/ --ctdir REPLY -j ACCEPT/' "$before_file"
+            changed=true
+        fi
+    done
+    local system_flag=false
+    local -a new_args=()
+    for arg in "$@"; do
+        if [[ "$arg" == "--system" ]]; then
+            system_flag=true
+        else
+            new_args+=("$arg")
+        fi
+    done
+    set -- "${new_args[@]}"
+
+    if ! ufw-docker--check-install "$@"; then
+        changed=true
+        local after_rules_bak
+        after_rules_bak="${after_rules}-ufw-docker~$(date '+%Y-%m-%d-%H%M%S')~"
+        err "\\nBacking up $after_rules to $after_rules_bak"
+        cp "$after_rules" "$after_rules_bak"
+        cat "$after_rules_tmp" > "$after_rules"
+    fi
+
+    if ! ufw-docker--check-install_ipv6 "$@"; then
+        changed=true
+        local after6_rules_bak
+        after6_rules_bak="${after6_rules}-ufw-docker~$(date '+%Y-%m-%d-%H%M%S')~"
+        err "\\nBacking up $after6_rules to $after6_rules_bak"
+        cp "$after6_rules" "$after6_rules_bak"
+        cat "$after6_rules_tmp" > "$after6_rules"
+    fi
+
+    if "$system_flag"; then
+        err "\\nInstalling 'ufw-docker' to '${bin_location}'"
+        mkdir -p "$(dirname "${bin_location}")"
+		cp -- "$0" "${bin_location}"
+
+        err "\\nInstalling man page to '${man_location}'"
+        mkdir -p "$(dirname "${man_location}")"
+        man-page | tee "${man_location}" >/dev/null
+        mandb -q
+
+        ufw_docker_bin="$bin_location" ufw-docker--install-service --force
+    fi
+
+    if "$changed"; then
+        err "\\nPlease restart UFW service manually by using the following command:"
+        if type systemctl &>/dev/null; then
+            err "    sudo systemctl restart ufw"
+        else
+            err "    sudo service ufw restart"
+        fi
+    fi
+}
+
+function ufw-docker--install-service() {
+    if ! command -v systemctl &>/dev/null; then
+        err "Only systemd is supported for service installation."
+        return 1
+    fi
+    local force=false
+    for arg in "$@"; do
+        if [[ "$arg" == "--force" ]]; then
+            force=true
+        fi
+    done
+    local ufw_docker_bin="${ufw_docker_bin:-$(realpath "$0")}"
+    if [ ! -f "$ufw_docker_service_file" ] || "$force"; then
+        err "\nInstalling ufw-docker service..."
+        err "--"
+        tee "$ufw_docker_service_file" <<EOF
+[Unit]
+Description=UFW Docker Firewall Rules
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=${ufw_docker_bin} reload
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        err "--"
+        chmod 644 "$ufw_docker_service_file"
+        err "Service file created at $ufw_docker_service_file"
+        systemctl daemon-reload
+        err "Service daemon reloaded."
+        systemctl enable --now ufw-docker
+        err "Service enabled and started."
+        err "Service installed successfully."
+    else
+        err "Service already installed."
+    fi
+}
+
+function ufw-docker--uninstall() {
+    local changed=false
+    local backup_suffix="$(date '+%Y-%m-%d-%H%M')"
+    if grep -F 'UFW DOCKER' "$after_rules" >/dev/null; then
+        cp -v "$after_rules" "${after_rules}~${backup_suffix}"
+        sed -i -e '/^# BEGIN UFW AND DOCKER/,/^# END UFW AND DOCKER/d' "$after_rules"
+        ! diff "${after_rules}~${backup_suffix}" "${after_rules}"
+        changed=true
+    fi
+    if grep -F 'UFW DOCKER' "$after6_rules" >/dev/null; then
+        cp -v "$after6_rules" "${after6_rules}~${backup_suffix}"
+        sed -i -e '/^# BEGIN UFW AND DOCKER/,/^# END UFW AND DOCKER/d' "$after6_rules"
+        ! diff "${after6_rules}~${backup_suffix}" "${after6_rules}"
+        changed=true
+    fi
+
+    if docker service inspect "$ufw_docker_agent" >/dev/null; then
+        docker service rm "$ufw_docker_agent"
+    fi
+
+    if [ -f "$bin_location" ]; then rm -v "$bin_location"; fi
+    if [ -f "$man_location" ]; then rm -v "$man_location"; fi
+
+    if [ -f "$ufw_docker_service_file" ]; then
+        err "\nUninstalling ufw-docker service..."
+        ! systemctl is-active --quiet ufw-docker || systemctl stop ufw-docker
+        ! systemctl is-enabled --quiet ufw-docker || systemctl disable ufw-docker
+        rm -v "$ufw_docker_service_file"
+        systemctl daemon-reload
+        err "Service uninstalled successfully."
+    fi
+
+    if "$changed"; then
+        err "\\nPlease restart UFW service manually by using the following command:"
+        if type systemctl &>/dev/null; then
+            err "    sudo systemctl restart ufw"
+        else
+            err "    sudo service ufw restart"
+        fi
+    fi
+}
+
+function ufw-docker--install--help() {
+    cat <<HELP
+ufw-docker $1 --docker-subnets [SUBNET1 SUBNET2 …] [--system]
+
+Specify which subnets should be used when configuring firewall rules for Docker containers and any allowed networks that communicate with containers.
+
+  - If this option is not provided, only standard private LAN subnets are used (RFC1918 for IPv4 and fd00::/8 for IPv6).
+  - If --docker-subnets is given without any arguments, all Docker network subnets will be automatically detected and used.
+  - If one or more subnets are specified, these subnets will be used for firewall rules, and they can include any networks that need to communicate with containers—not just the subnets configured by the Docker engine.
+    You can specify multiple subnets separated by spaces (each in CIDR format).
+
+Examples:
+  - ufw-docker $1
+    Use only standard private subnets (default behavior).
+      - IPv4 subnets: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+      - IPv6 subnet: fd00::/8
+
+  - ufw-docker $1 --docker-subnets
+    Auto-detect and use all Docker network subnets.
+
+  - ufw-docker $1 --docker-subnets 10.207.0.0/16 192.168.207.0/24 fd00:cf::/64
+    Use only the specified subnets, including those outside of Docker’s own configuration, for all networks that should be allowed to communicate with containers.
+
+Additionally the flag '--system' can be used to install the included man-page to the system.
+HELP
+}
+
+function ufw-docker--help() {
+    cat <<-EOF >&2
+	Usage:
+	  ufw-docker <list|allow> [docker-instance-id-or-name [port[/tcp|/udp]] [network]]
+	  ufw-docker delete allow [docker-instance-id-or-name [port[/tcp|/udp]] [network]]
+
+	  ufw-docker service allow <swarm-service-id-or-name <port</tcp|/udp>>>
+	  ufw-docker service delete allow <swarm-service-id-or-name>
+
+	  ufw-docker <install|check> [--docker-subnets [SUBNET0 SUBNET1 ...]] [--system]
+	  ufw-docker install-service [--force]
+
+	  ufw-docker <status|install|install-service|uninstall|check|reload|man[page]|help>
+
+	Examples:
+	  ufw-docker help
+	  ufw-docker man
+	  ufw-docker check --help
+	  ufw-docker install --help
+
+	  ufw-docker check                         # Check the installation of firewall rules
+	  ufw-docker check --docker-subnets        # Auto-detect and use all Docker network subnets
+	  ufw-docker check --docker-subnets 192.168.207.0/24 10.207.0.0/16 fd00:cf::/64
+
+	  ufw-docker install --system             # Install firewall rules and man-page
+	  ufw-docker install --docker-subnets     # Auto-detect and use all Docker network subnets
+	  ufw-docker install --docker-subnets 192.168.207.0/24 10.207.0.0/16 fd00:cf::/64
+	  ufw-docker install --docker-subnets 192.168.207.0/24 10.207.0.0/16 fd00:cf::/64
+
+	  ufw-docker install-service              # Install the ufw-docker service
+	  ufw-docker install-service --force      # Install the ufw-docker service, overwriting the existing service file
+
+	  ufw-docker status
+
+	  ufw-docker list httpd
+
+	  ufw-docker allow httpd
+	  ufw-docker allow httpd 80
+	  ufw-docker allow httpd 80/tcp
+	  ufw-docker allow httpd 80/tcp default
+
+	  ufw-docker delete allow httpd
+	  ufw-docker delete allow httpd 80/tcp
+	  ufw-docker delete allow httpd 80/tcp default
+
+	  ufw-docker service allow httpd 80/tcp
+
+	  ufw-docker service delete allow httpd
+
+	  ufw-docker reload                       # Reload all firewall rules
+	EOF
+}
+
+function man-page() {
+	cat <<-EOF
+	.\" ufw-docker.8 - fix the Docker and UFW security flaw without disabling iptables
+	.\" install in /usr/local/man/man8/ufw-docker.8
+	.TH UFW-DOCKER 8 2025-07-31
+
+	.SH NAME
+	ufw-docker \- fix the Docker and UFW security flaw without disabling iptables
+
+	.SH SYNOPSIS
+	.B ufw-docker
+	help|status|man|uninstall
+	.br
+	.B ufw-docker
+	install|check [--help] [--docker-subnets [\fIsubnet\fR ...]] [--system]
+	.br
+	.B ufw-docker
+	install-service [--force]
+	.br
+	.B ufw-docker
+	allow|deny|list
+	\fIcontainer\fR [\fIport\fR[/tcp|/udp]] [\fInetwork\fR]
+	.br
+	.B ufw-docker
+	[service] allow|deny
+	\fIcontainer\fR [\fIport\fR[/tcp|/udp]] [\fInetwork\fR]
+	.br
+	.B ufw-docker
+	[service] delete allow|deny
+	\fIcontainer\fR [\fIport\fR[/tcp|/udp]] [\fInetwork\fR]
+
+	.SH DESCRIPTION
+	Docker manages iptables directly, bypassing UFW and exposing published ports regardless of UFW rules. ufw-docker inserts a set of iptables rules into UFW’s after.rules (via DOCKER-USER chain) so that UFW can govern which published ports are reachable from public networks.
+
+	.SH COMMANDS
+	.TP
+	.B install \fR[--help] [--docker-subnets [\fIsubnet\fR ...]] [--system]
+	Inserts the special rules block into '$after_rules'. With --system also installs the manpage into '$man_location'.
+
+	Use --docker-subnets to customize which subnets will be allowed to communicate with Docker containers. If the option is \fBnot provided\fR, only standard private LAN subnets will be used (IPv4: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16; IPv6: fd00::/8). If no subnets are provided all Docker network subnets will be detected and used automatically.
+	This option applies to both IPv4 and IPv6 networks.
+
+	Using --help shows more explanatory text and exits.
+
+	.TP
+	.B install-service \fR[--force]
+	Install the ufw-docker service. Use --force to overwrite the existing service file.
+
+	.TP
+	.B uninstall
+	Removes the script, man-page and the applied ufw rules.
+
+	.TP
+	.B check \fR[--help] [--docker-subnets [\fIsubnet\fR ...]] [--system]
+	Same as \fBinstall\fR, but shows the changes instead of appling them.
+
+	.TP
+	.B reload
+	Reloads all firewall rules. This is useful when container IPs change after a restart.
+
+	.TP
+	.B help
+	Shows a help page. See 'ufw-docker man' for more detailed explanations.
+
+	.TP
+	.B list \fIcontainer\fR [\fIport\fR[\fB/tcp\fR|\fB/udp\fR]] [\fInetwork\fR]
+	Lists all firewall rules related to a specific container. Can be filtered to only show a specific port with a specific protocol for a specific network.
+
+	.TP
+	.B man\fR[\fBpage\fR]
+	Shows the man page of 'ufw-docker'. (Similar to 'man ufw-docker'.)
+
+	.TP
+	.B status
+	Shows the current firewall allowed forward rules.
+
+	.TP
+	.B allow\fR|\fBdeny \fIcontainer\fR [\fIport\fR[\fB/tcp\fR|\fB/udp\fR]] [\fInetwork\fR]
+	Adds a UFW rule allowing/denying traffic to the specified container. Can be further limited to a port, protocol or network.
+
+	(Can be prepended with \fBservice\fR to target services instead of containers.)
+
+	.TP
+	.B delete allow\fR|\fBdeny \fIcontainer\fR [\fIport\fR[\fB/tcp\fR|\fB/udp\fR]] [\fInetwork\fR]
+	Removes \fBALL\fR rules that allow/deny traffic to a container. Can be further limited to only remove rules with a specific port, protocol or network.
+
+	(Can be prepended with \fBservice\fR to target services instead of containers.)
+
+	.SH EXIT STATUS
+	.TP
+	0
+	Successful program execution.
+	.TP
+	1
+	Unsuccessful program execution.
+
+	.SH EXAMPLES
+
+	.TP
+	.B ufw-docker install --system
+	.TP
+	.PP
+	Use default private LAN subnets (IPv4: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, IPv6: fd00::/8). Also install the man page.
+
+	.TP
+	.B ufw-docker install --docker-subnets
+	.TP
+	.PP
+	Auto-detect and use all Docker network subnets (both IPv4 and IPv6).
+
+	.TP
+	.B ufw-docker install-service
+	.TP
+	.PP
+	Install the ufw-docker service.
+
+	.TP
+	.B ufw-docker list httpd
+	.TP
+	.PP
+	List all firewall rules related to container \fIhttpd\fR.
+
+	.TP
+	.B ufw-docker allow httpd 443/tcp foobar-external-network
+	.TP
+	.PP
+	Expose the \fI443\fR port of the container \fIhttpd\fR and the protocol is \fItcp\fR and the network is \fIfoobar-external-network\fR when the container \fIhttpd\fR is attached to multiple networks.
+
+	.TP
+	.B ufw-docker delete allow httpd 443/tcp
+	.TP
+	.PP
+	Remove the rule which port is \fI443\fR and protocol is \fItcp\fR for the container \fIhttpd\fR.
+
+	.TP
+	.B
+	.TP
+	.PP
+	t
+
+
+	.SH FILES
+	.TP
+	.B ${after_rules}
+	Modified by install/uninstall.
+
+	.TP
+	.B ${after6_rules}
+	Modified by install, if ip6tables is available.
+
+	.TP
+	.B ${man_location}
+	Modified by install, when the --system flag is set.
+
+	.SH NOTES
+	.B INSTALL
+
+	.nf
+	# download the script
+	sudo wget -O /usr/local/bin/ufw-docker \\
+		https://github.com/chaifeng/ufw-docker/raw/master/ufw-docker
+	sudo chmod +x /usr/local/bin/ufw-docker
+
+	# integrate with UFW (adds iptables rules) and installs the man page
+	sudo ufw-docker install --system
+	.fi
+
+	.B UNINSTALL
+
+	Open file \fI${after_rules}\fR (and \fI${after6_rules}\fR), remove all lines between
+	.B # BEGIN UFW AND DOCKER
+	and
+	.B # END UFW AND DOCKER
+	.
+
+	.PP
+	If you want to remove all things related to ufw-docker:
+
+	.TP
+	.B 1.
+	Remove the script \fBufw-docker\fR, this man page and the ufw rules with 'ufw-docker uninstall'
+
+	.TP
+	.B 2.
+	Run the following command to find the docker image downloaded by ufw-docker.
+
+	.nf
+	\fBdocker images | grep ufw-docker-agent\fR
+	.fi
+
+	.TP
+	.B 3.
+	Then use the following command to remove the corresponding Docker image.
+
+	.nf
+	\fBdocker rmi\fR \fIimage\fR
+	.fi
+
+	.SH AUTHOR
+	Script by Chai Feng and contributors. Source:
+	https://github.com/chaifeng/ufw-docker
+
+	(Man page by Elia Nitsche.)
+
+	.SH SEE ALSO
+	.BR ufw (8),
+	.BR docker (1),
+	.BR iptables (8)
+	EOF
+}
+
+function remove_blank_lines() {
+    sed '/^[[:blank:]]*$/d'
+}
+
+function ufw-docker--host-uses-legacy-iptables() {
+    iptables --version | grep -F '(legacy)' &>/dev/null
+}
+
+function ufw-docker--probe-agent-image() {
+    local image="${1:?Missing agent image for probing}"
+    local output
+
+    if output="$(docker run --rm --network host --cap-add NET_ADMIN \
+                      "${image}" /bin/sh -c '/usr/sbin/iptables -t filter -S >/dev/null' 2>&1)"; then
+        ufw_docker_agent_image_probe_error=''
+        return 0
+    fi
+
+    output="${output//$'\r'/ }"
+    output="${output//$'\n'/ }"
+    output="${output//$'\t'/ }"
+    ufw_docker_agent_image_probe_error="${output:-unknown error}"
+    return 1
+}
+
+function ufw-docker--resolve-agent-image() {
+    local image="${1:?Missing agent image}"
+    local image_base
+    local nft_image
+    local legacy_image
+    local nft_probe_error=''
+    local legacy_probe_error=''
+
+    if [[ "${image}" != *-@(legacy|nf_tables) ]]; then
+        printf '%s\n' "${image}"
+        return 0
+    fi
+
+    image_base="${image%-*}"
+    nft_image="${image_base}-nf_tables"
+    legacy_image="${image_base}-legacy"
+
+    if ufw-docker--host-uses-legacy-iptables; then
+        printf '%s\n' "${legacy_image}"
+        return 0
+    fi
+
+    if ufw-docker--probe-agent-image "${nft_image}"; then
+        printf '%s\n' "${nft_image}"
+        return 0
+    fi
+    nft_probe_error="${ufw_docker_agent_image_probe_error}"
+
+    if ufw-docker--probe-agent-image "${legacy_image}"; then
+        err "WARN:" "Falling back to ${legacy_image} after nftables probe failed for ${nft_image}: ${nft_probe_error}"
+        printf '%s\n' "${legacy_image}"
+        return 0
+    fi
+    legacy_probe_error="${ufw_docker_agent_image_probe_error}"
+
+    die "Failed to find a compatible ufw-docker-agent image. nftables probe failed for ${nft_image}: ${nft_probe_error}; legacy probe failed for ${legacy_image}: ${legacy_probe_error}"
+}
+
+function err() {
+    echo -e "$@" >&2
+}
+
+function die() {
+    err "ERROR:" "$@"
+    exit 1
+}
+
+# __main__
+
+if ! ufw status 2>/dev/null | grep -Eq "Status: active|Состояние: активен" ; then
+    die "UFW is disabled or you are not root user, or mismatched iptables legacy/nf_tables, current $(iptables --version)"
+fi
+
+if ! docker -v &> /dev/null; then
+  die "Docker executable not found."
+fi
+
+ufw_action="${1:-help}"
+
+case "$ufw_action" in
+    delete)
+        shift || true
+        if [[ "${1:?Invalid 'delete' command syntax.}" != "allow" ]]; then
+            die "\"delete\" command only support removing allowed rules"
+        fi
+        ;&
+    list|allow)
+        shift || true
+
+        INSTANCE_ID="${1:?Docker instance name/ID cannot be empty.}"
+        INSTANCE_NAME="$(ufw-docker--instance-name "$INSTANCE_ID")"
+        shift || true
+
+        INSTANCE_PORT="${1:-}"
+        if [[ -n "$INSTANCE_PORT" && ! "$INSTANCE_PORT" =~ [0-9]+(/(tcp|udp))? ]]; then
+            die "invalid port syntax: \"$INSTANCE_PORT\"."
+        fi
+
+        if [[ -n "$INSTANCE_PORT" ]]; then
+            if [[ "$INSTANCE_PORT" = */* ]]; then
+                PROTO="${INSTANCE_PORT#*/}"
+            else
+                PROTO="$DEFAULT_PROTO"
+            fi
+        else
+            PROTO=""
+        fi
+        shift || true
+
+        NETWORK="${1:-}"
+
+        INSTANCE_PORT="${INSTANCE_PORT%/*}"
+        ;;&
+    delete|list)
+        "ufw-docker--$ufw_action" "$INSTANCE_NAME" "$INSTANCE_PORT" "$PROTO" "$NETWORK"
+        ;;
+    allow)
+        "ufw-docker--$ufw_action" "$INSTANCE_NAME" "$INSTANCE_PORT" "$PROTO" "$NETWORK"
+        ;;
+    service|raw-command|add-service-rule|install-service)
+        shift || true
+        "ufw-docker--$ufw_action" "$@"
+        ;;
+    install|check)
+        shift || true
+        if [[ "${1-}" = @(help|-h|--help) ]]; then
+            ufw-docker--install--help "$ufw_action"
+            exit
+        fi
+        "ufw-docker--$ufw_action" "$@"
+        ;;
+    uninstall)
+        ufw-docker--uninstall "$@"
+        ;;
+    reload)
+        ufw-docker--reload
+        ;;
+    status)
+        ufw-docker--"$ufw_action"
+        ;;
+    man|manpage)
+        man-page | man -l -
+        ;;
+    *)
+        ufw-docker--help
+        ;;
+esac

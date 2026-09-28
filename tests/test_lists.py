@@ -1,14 +1,8 @@
 """
-Тесты белого и чёрного списков, включая CIDR-подсети (чек-лист §4, §5).
+Тесты белого списка, включая CIDR-подсети.
 """
-import pytest
-
 from conftest import post
 
-
-# ──────────────────────────────────────────────
-# Белый список
-# ──────────────────────────────────────────────
 
 def add_whitelist(client, ip, owner='', comment=''):
     return post(client, '/whitelist', data={
@@ -42,7 +36,6 @@ def test_whitelist_invalid_ip(auth_client):
     """4.4 — некорректный IP не добавляется."""
     r = add_whitelist(auth_client, '999.999.x.x')
     assert r.status_code == 200
-    # IP не должен появиться в таблице
     assert b'999.999.x.x' not in r.data
 
 
@@ -68,39 +61,7 @@ def test_whitelist_delete(auth_client, app):
         assert entry is None
 
 
-# ──────────────────────────────────────────────
-# Чёрный список
-# ──────────────────────────────────────────────
-
-def add_blacklist(client, ip, reason='', comment=''):
-    return post(client, '/blacklist', data={
-        'ip_address': ip,
-        'reason': reason,
-        'comment': comment,
-    }, follow_redirects=True)
-
-
-def test_blacklist_page_loads(auth_client):
+def test_blacklist_routes_removed(auth_client):
+    """Чёрный список вырезан — маршрутов больше нет."""
     r = auth_client.get('/blacklist')
-    assert r.status_code == 200
-
-
-def test_blacklist_add_single_ip(auth_client):
-    """5.2 — добавить одиночный IP в чёрный список."""
-    r = add_blacklist(auth_client, '5.6.7.8', reason='сканирование')
-    assert r.status_code == 200
-    assert b'5.6.7.8' in r.data
-
-
-def test_blacklist_add_subnet(auth_client):
-    """5.3 — добавить подсеть в чёрный список."""
-    r = add_blacklist(auth_client, '10.0.0.0/24', reason='тест')
-    assert r.status_code == 200
-    assert b'10.0.0.0/24' in r.data
-
-
-def test_blacklist_invalid_ip(auth_client):
-    """5.4 — некорректный IP не добавляется."""
-    r = add_blacklist(auth_client, 'not-an-ip')
-    assert r.status_code == 200
-    assert b'not-an-ip' not in r.data
+    assert r.status_code == 404

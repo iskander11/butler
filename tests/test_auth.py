@@ -15,7 +15,7 @@ def test_redirect_to_login_without_session(client):
 
 def test_protected_page_redirects_to_login(client):
     """2.5 — прямой URL к защищённой странице без сессии → логин."""
-    for url in ['/services', '/attempts', '/whitelist', '/blacklist', '/firewall']:
+    for url in ['/services', '/attempts', '/whitelist', '/firewall']:
         r = client.get(url, follow_redirects=False)
         assert r.status_code == 302, f'{url} должен редиректить'
         assert '/login' in r.headers['Location']

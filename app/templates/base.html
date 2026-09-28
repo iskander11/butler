@@ -20,7 +20,6 @@
                 <a href="{{ url_for('main.services') }}"{% if request.endpoint == 'main.services' %} class="active"{% endif %}>Сервисы</a>
                 <a href="{{ url_for('main.attempts') }}"{% if request.endpoint == 'main.attempts' %} class="active"{% endif %}>Попытки</a>
                 <a href="{{ url_for('main.whitelist') }}"{% if request.endpoint in ('main.whitelist', 'main.edit_whitelist_entry') %} class="active"{% endif %}>Белый список</a>
-                <a href="{{ url_for('main.blacklist') }}"{% if request.endpoint in ('main.blacklist', 'main.edit_blacklist_entry') %} class="active"{% endif %}>Чёрный список</a>
                 <a href="{{ url_for('main.audit_log') }}"{% if request.endpoint == 'main.audit_log' %} class="active"{% endif %}>Журнал</a>
                 <a href="{{ url_for('main.firewall') }}"{% if request.endpoint == 'main.firewall' %} class="active"{% endif %}>Firewall</a>
             </nav>

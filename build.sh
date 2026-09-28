@@ -169,7 +169,7 @@ install -m 755 "${SCRIPT_DIR}/butler"      "${DIST_DIR}/butler"
 install -m 644 "${SCRIPT_DIR}/env.example" "${DIST_DIR}/butler.env.example"
 # Инструкции кладём рядом, чтобы архив был самодостаточным:
 # тестировщику может достаться только tar.gz, без доступа к репозиторию.
-for _doc in README.md TESTING.md; do
+for _doc in README.md USER_GUIDE.md TESTING.md; do
   if [[ -f "${SCRIPT_DIR}/${_doc}" ]]; then
     install -m 644 "${SCRIPT_DIR}/${_doc}" "${DIST_DIR}/${_doc}"
   fi
@@ -185,6 +185,9 @@ cp    "${SCRIPT_DIR}/butler-log-import.py"             "${INNER_DIR}/butler-log-
 cp    "${SCRIPT_DIR}/butler-log-import.service"        "${INNER_DIR}/butler-log-import.service"
 cp    "${SCRIPT_DIR}/butler-log-import.timer"          "${INNER_DIR}/butler-log-import.timer"
 cp -r "${WHEELS_DIR}"                                  "${INNER_DIR}/wheels"
+if [[ -d "${SCRIPT_DIR}/bundled" ]]; then
+  cp -r "${SCRIPT_DIR}/bundled"                        "${INNER_DIR}/bundled"
+fi
 
 # Убираем кэш python
 find "${INNER_DIR}/app" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true

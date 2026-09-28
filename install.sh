@@ -187,6 +187,19 @@ trap - ERR
 ok "Зависимости установлены."
 
 # ---------------------------------------------------------------------------
+# Шаг 2b — ufw-docker (Docker + UFW, вызывается Butler при Apply)
+# ---------------------------------------------------------------------------
+BUNDLED_UFW_DOCKER="${INNER_DIR}/bundled/ufw-docker"
+UFW_DOCKER_BIN="${INNER_DIR}/bin/ufw-docker"
+if [[ -f "$BUNDLED_UFW_DOCKER" ]]; then
+  mkdir -p "${INNER_DIR}/bin"
+  install -m 755 "$BUNDLED_UFW_DOCKER" "$UFW_DOCKER_BIN"
+  ok "ufw-docker установлен: $UFW_DOCKER_BIN"
+else
+  warn "bundled/ufw-docker не найден — Docker-изоляция через Butler не заработает."
+fi
+
+# ---------------------------------------------------------------------------
 # Шаг 3 — инициализация БД
 # ---------------------------------------------------------------------------
 echo "Инициализирую базу данных..."
@@ -233,7 +246,7 @@ Group=${BUTLER_USER}
 WorkingDirectory=${INNER_DIR}
 EnvironmentFile=${ENV_FILE}
 Environment=BUTLER_ENV_FILE=${ENV_FILE}
-ExecStart=${VENV_DIR}/bin/gunicorn --workers 2 --bind 0.0.0.0:${BUTLER_PORT} wsgi:app
+ExecStart=${VENV_DIR}/bin/gunicorn --workers 2 --timeout 300 --bind 0.0.0.0:${BUTLER_PORT} wsgi:app
 Restart=always
 RestartSec=3
 

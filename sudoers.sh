@@ -48,7 +48,7 @@ fi
 # Проверяем наличие команд
 # ---------------------------------------------------------------------------
 REQUIRED_CMDS=(mkdir install test cat journalctl ufw)
-OPTIONAL_CMDS=(conntrack)
+OPTIONAL_CMDS=(conntrack iptables ip6tables)
 
 # visudo нужен только для валидации, ищем в PATH
 VISUDO_BIN="$(PATH="$PATH:/usr/sbin" command -v visudo 2>/dev/null || true)"
@@ -79,17 +79,32 @@ CAT_BIN="$(_bin cat)"
 JOURNALCTL_BIN="$(_bin journalctl)"
 UFW_BIN="$(_bin ufw)"
 
-# Conntrack (опционально)
+# Butler vendored ufw-docker (.butler/bin/ufw-docker)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UFW_DOCKER_BIN="${SCRIPT_DIR}/.butler/bin/ufw-docker"
+
+# Conntrack / iptables (опционально)
 CONNTRACK_BIN=""
 if PATH="$PATH:/usr/sbin" command -v conntrack > /dev/null 2>&1; then
   CONNTRACK_BIN="$(_bin conntrack)"
+fi
+IPTABLES_BIN=""
+if PATH="$PATH:/usr/sbin" command -v iptables > /dev/null 2>&1; then
+  IPTABLES_BIN="$(_bin iptables)"
+fi
+IP6TABLES_BIN=""
+if PATH="$PATH:/usr/sbin" command -v ip6tables > /dev/null 2>&1; then
+  IP6TABLES_BIN="$(_bin ip6tables)"
 fi
 
 # ---------------------------------------------------------------------------
 # Формируем список всех команд для sudoers
 # ---------------------------------------------------------------------------
 ALL_BINS=("$UFW_BIN" "$MKDIR_BIN" "$INSTALL_BIN" "$TEST_BIN" "$CAT_BIN" "$JOURNALCTL_BIN")
+[[ -x "$UFW_DOCKER_BIN" ]] && ALL_BINS+=("$UFW_DOCKER_BIN")
 [[ -n "$CONNTRACK_BIN" ]] && ALL_BINS+=("$CONNTRACK_BIN")
+[[ -n "$IPTABLES_BIN" ]] && ALL_BINS+=("$IPTABLES_BIN")
+[[ -n "$IP6TABLES_BIN" ]] && ALL_BINS+=("$IP6TABLES_BIN")
 
 # Строка NOPASSWD для sudoers.
 # ВАЖНО: sudo матчит команду ВМЕСТЕ С АРГУМЕНТАМИ. Правило вида
@@ -161,7 +176,7 @@ fi
 
 ok "Sudoers настроен для пользователя: ${BUTLER_USER}"
 echo "  Файл: $SUDOERS_FILE"
-echo "  Разрешены: ufw, journalctl${CONNTRACK_BIN:+, conntrack}"
+echo "  Разрешены: ufw, journalctl${CONNTRACK_BIN:+, conntrack}${IPTABLES_BIN:+, iptables}${IP6TABLES_BIN:+, ip6tables}"
 echo ""
 warn "Butler применяет правила UFW идемпотентно, без \"ufw reset\" —"
 warn "sudoers и активные соединения (SSH) не затрагиваются."

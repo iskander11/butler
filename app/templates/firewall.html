@@ -1,83 +1,23 @@
 {% extends 'base.html' %}
 {% block title %}Firewall — Дворецкий{% endblock %}
 {% block content %}
-
 <section class="panel">
-    <h2>Режим работы</h2>
-    <p>
-        Определяет, какой список используется при генерации правил
-        <strong>UFW</strong>.
-        Второй список при этом <strong>игнорируется</strong> полностью.
-    </p>
-
-    <div class="mode-switcher">
-        <form method="post" action="{{ url_for('main.set_firewall_mode') }}">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="mode" value="whitelist">
-            <button type="submit"
-                    class="{% if mode == 'whitelist' %}mode-active{% else %}mode-inactive{% endif %}">
-                Только белый список
-            </button>
-        </form>
-        <form method="post" action="{{ url_for('main.set_firewall_mode') }}">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="mode" value="blacklist">
-            <button type="submit"
-                    class="{% if mode == 'blacklist' %}mode-active{% else %}mode-inactive{% endif %}">
-                Только чёрный список
-            </button>
-        </form>
-    </div>
-
-    {% if mode == 'whitelist' %}
-    <p class="mode-hint mode-hint-whitelist">
-        <strong>Активен: белый список.</strong>
-        Доступ только у IP из белого списка. Все остальные — drop.
-    </p>
-    {% else %}
-    <p class="mode-hint mode-hint-blacklist">
-        <strong>Активен: чёрный список.</strong>
-        Заблокированы только IP из чёрного списка. Все остальные — accept.
-    </p>
-    {% endif %}
-</section>
-
-<section class="panel">
-    <div class="panel-header">
-        <div>
-            <h2>Сгенерированные правила</h2>
-            <p>Предпросмотр UFW-команд на основе текущей базы и режима. Применяется только вручную.</p>
-        </div>
-    </div>
-
+    <h2>Сгенерированные правила</h2>
     {% if skipped %}
-    <div class="flash flash-error" style="margin-bottom:12px;">
-        Следующие адреса некорректны и не включены в правила:
-        <code>{{ skipped | join(', ') }}</code>
-    </div>
+    <div class="flash flash-error">Некорректные адреса: {{ skipped | join(', ') }}</div>
     {% endif %}
-
     <div class="firewall-actions">
         <form method="post" action="{{ url_for('main.export_firewall') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button type="submit">Сохранить в файл</button>
         </form>
-
         <form method="post" action="{{ url_for('main.firewall_apply') }}"
               onsubmit="return confirm('Применить правила через UFW прямо сейчас?')">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="confirm_apply" value="yes">
             <button type="submit" class="button-warning">Применить правила</button>
         </form>
-
-        <form method="post" action="{{ url_for('main.firewall_reset') }}"
-              onsubmit="return confirm('Сбросить все Butler-правила? SSH и порт панели останутся открыты.')">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="confirm_reset" value="yes">
-            <button type="submit" class="button-danger">Сбросить правила</button>
-        </form>
     </div>
-
     <pre class="code-block">{{ rules }}</pre>
 </section>
 {% endblock %}
